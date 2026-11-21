@@ -120,6 +120,42 @@ def test_bearer_token_required_and_accepted():
     assert listed["result"]["tools"]
 
 
+def test_bare_token_and_lowercase_header_accepted():
+    with TestClient(_fresh_app(token="s3cret"), base_url=LOCAL) as client:
+        _, listed = _handshake(client, {**HEADERS, "authorization": "s3cret"})
+        assert listed["result"]["tools"]
+        _, listed = _handshake(client, {**HEADERS, "authorization": "bearer   s3cret "})
+        assert listed["result"]["tools"]
+
+
+def test_rejection_reason_is_logged_without_the_token(capsys):
+    with TestClient(_fresh_app(token="s3cret"), base_url=LOCAL) as client:
+        client.post("/mcp", headers=HEADERS, json=_rpc("ping"))
+        client.post("/mcp", headers={**HEADERS, "Authorization": "Bearer wrong-one"}, json={})
+        client.post("/mcp", headers={**HEADERS, "Authorization": "Basic s3cret"}, json={})
+    err = capsys.readouterr().err
+    assert "401 POST /mcp: no Authorization header" in err
+    assert "mismatch (got 9 chars, expected 6)" in err
+    assert "scheme is not Bearer" in err
+    assert "wrong-one" not in err and "s3cret" not in err
+
+
+def test_oauth_discovery_is_404_not_401():
+    with TestClient(_fresh_app(token="s3cret"), base_url=LOCAL) as client:
+        for p in (
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-authorization-server",
+        ):
+            assert client.get(p).status_code == 404
+
+
+def test_secret_store_value_with_bearer_prefix_or_quotes(monkeypatch):
+    monkeypatch.setenv(http_transport.ENV_TOKEN, ' "Bearer abc123" ')
+    assert http_transport.resolve_token(None) == "abc123"
+    monkeypatch.setenv(http_transport.ENV_TOKEN, "'xyz'\n")
+    assert http_transport.resolve_token(None) == "xyz"
+
+
 def test_non_loopback_host_has_no_host_check_but_needs_token():
     sec = http_transport.security_settings("0.0.0.0")
     assert sec.enable_dns_rebinding_protection is False

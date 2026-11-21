@@ -25,6 +25,7 @@ import hmac
 import ipaddress
 import json
 import os
+import sys
 from typing import Any
 
 ENV_TOKEN = "APPLEMUSIC_MCP_TOKEN"
@@ -86,7 +87,10 @@ def resolve_port(cli_port: int | None) -> int:
 def resolve_token(cli_token: str | None) -> str | None:
     """The bearer token from ``--token`` or the environment; empty means none."""
     token = cli_token if cli_token is not None else os.environ.get(ENV_TOKEN, "")
-    token = token.strip()
+    token = token.strip().strip("\"'").strip()
+    # A pasted "Bearer <token>" in the secret store means the token itself.
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
     return token or None
 
 
@@ -125,17 +129,30 @@ class HealthCheck:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope.get("type") == "http" and scope.get("path") == HEALTH_PATH:
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": [(b"content-type", b"text/plain"), (b"content-length", b"2")],
-                }
-            )
-            await send({"type": "http.response.body", "body": b"ok"})
+        path = scope.get("path") or ""
+        if scope.get("type") == "http" and path == HEALTH_PATH:
+            await _plain(send, 200, b"ok")
+            return
+        # OAuth discovery: this server has no OAuth, and saying so with a 404
+        # (not a 401) tells a client to stop looking and use its static header.
+        if scope.get("type") == "http" and path.startswith("/.well-known/"):
+            await _plain(send, 404, b"not found")
             return
         await self.app(scope, receive, send)
+
+
+async def _plain(send, status: int, body: bytes) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"text/plain"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
 
 
 class BearerAuth:
@@ -148,18 +165,40 @@ class BearerAuth:
         self.app = app
         self._token = token.encode()
 
+    def _check(self, headers) -> tuple[bool, str]:
+        """(accepted, reason). The reason is logged on rejection; it carries
+        lengths only, never a token value."""
+        raw = None
+        for name, value in headers or []:
+            if name.lower() == b"authorization":
+                raw = value.strip()
+                break
+        if raw is None:
+            return False, "no Authorization header"
+        scheme, sep, rest = raw.partition(b" ")
+        if sep and scheme.lower() == b"bearer":
+            supplied = rest.strip()
+        elif not sep:
+            supplied = raw  # the bare token, without the "Bearer " prefix
+        else:
+            return False, f"Authorization scheme is not Bearer ({len(scheme)}-char scheme)"
+        if supplied and hmac.compare_digest(supplied, self._token):
+            return True, ""
+        return False, (
+            f"bearer token mismatch (got {len(supplied)} chars, expected {len(self._token)})"
+        )
+
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
             return await self.app(scope, receive, send)
-        supplied = b""
-        for name, value in scope.get("headers") or []:
-            if name.lower() == b"authorization":
-                scheme, _, rest = value.partition(b" ")
-                if scheme.lower() == b"bearer":
-                    supplied = rest.strip()
-                break
-        if supplied and hmac.compare_digest(supplied, self._token):
+        ok, reason = self._check(scope.get("headers"))
+        if ok:
             return await self.app(scope, receive, send)
+        print(
+            f"applemusic-mcp: 401 {scope.get('method', '')} {scope.get('path', '')}: {reason}",
+            file=sys.stderr,
+            flush=True,
+        )
         body = json.dumps(
             {
                 "jsonrpc": "2.0",
