@@ -47,3 +47,25 @@ Cursor, Windsurf and other clients that accept a URL take `{"mcpServers": {"Appl
 
 Tool calls run one at a time across all clients (Music.app and the web player can't take two callers at once), so a long call such as a big playlist copy makes the others wait.
 
+## Cloud deployment (Railway and similar)
+
+The repo's `Dockerfile` builds a server that keeps working while your Mac is off. A container has no Music.app or browser, so it runs at `--level api` with `--no-playback`: catalog search, your library, playlists and discovery, with no playback, Up Next or AirPlay.
+
+It needs two secrets, set in the host's secret store (on Railway, as **sealed** variables, which the dashboard, API and CLI never show again):
+
+| Variable | Value |
+|---|---|
+| `APPLEMUSIC_MCP_TOKEN` | The bearer token clients send. At least 32 characters; `openssl rand -hex 32` makes one. |
+| `APPLEMUSIC_USER_TOKEN` | Your Apple Music media-user-token. Sign in on your Mac (`applemusic-mcp login`), then `applemusic-mcp export-token` copies it to the clipboard without printing it. |
+
+The developer token is fetched from music.apple.com on demand, so nothing else is required. The server listens on `$PORT`, and `GET /healthz` returns `ok` without auth for the platform's health check; every other request needs `Authorization: Bearer <token>`.
+
+Connect a client with the URL the host gives you:
+
+```bash
+claude mcp add --transport http "Apple Music" https://<your-app>.up.railway.app/mcp \
+  --header "Authorization: Bearer <your APPLEMUSIC_MCP_TOKEN>"
+```
+
+**What the host holds.** The user token reads and writes your Apple Music library, playlists and listening history. Whoever runs the container can, in principle, read it. Apple documents no way to revoke it early; it expires after about six months, and then you sign in again and update the variable. Use a host you trust, keep the bearer token secret, and rotate it if it leaks.
+

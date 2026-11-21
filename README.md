@@ -139,6 +139,7 @@ Batching, importing playlists, dry runs, export formats and storefronts: [usage 
 ```bash
 applemusic-mcp serve --level music   # run the MCP server (your client calls this)
 applemusic-mcp serve --transport http # long-running Streamable HTTP server on 127.0.0.1:8770/mcp
+applemusic-mcp export-token          # copy your Apple Music user token, for a cloud deployment
 applemusic-mcp login                 # web sign-in (macOS: Safari; Windows/Linux: Chrome)
 applemusic-mcp login --chrome        # use the Chrome web player on a Mac
 applemusic-mcp login --dev           # your own Apple developer token (.p8)

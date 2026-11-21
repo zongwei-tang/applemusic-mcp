@@ -10404,10 +10404,17 @@ def _shutdown_browser_engine():  # pragma: no cover - lifecycle, not exercised u
         pass
 
 
+ENV_NO_PLAYBACK = "APPLEMUSIC_NO_PLAYBACK"
+
+
 def hidden_tools(lvl) -> set[str]:
     """Tools that can't do anything at this permission level, so the model
     never sees them."""
     hidden = set()
+    # `serve --no-playback` (or APPLEMUSIC_NO_PLAYBACK=1): a library-and-playlist
+    # server, e.g. in the cloud where there is no device to play on.
+    if os.environ.get(ENV_NO_PLAYBACK) == "1":
+        hidden.update({"playback", "queue"})
     if not lvl.web:
         hidden.add("queue")
     if not lvl.network:

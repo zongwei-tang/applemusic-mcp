@@ -12,6 +12,7 @@ from starlette.testclient import TestClient
 from applemusic_mcp import cli, http_transport, server
 
 LOCAL = "http://127.0.0.1:8770"
+STRONG = "f" * 64  # passes the public-bind length check
 HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 
 
@@ -124,9 +125,32 @@ def test_non_loopback_host_has_no_host_check_but_needs_token():
     assert sec.enable_dns_rebinding_protection is False
     with pytest.raises(ValueError, match="bearer token"):
         http_transport.check_bind("0.0.0.0", None)
-    http_transport.check_bind("0.0.0.0", "tok")  # no raise
+    with pytest.raises(ValueError, match="at least 32"):
+        http_transport.check_bind("0.0.0.0", "short-token")
+    http_transport.check_bind("0.0.0.0", STRONG)  # no raise
     http_transport.check_bind("127.0.0.1", None)
+    http_transport.check_bind("127.0.0.1", "short is fine locally")
     http_transport.check_bind("::1", None)
+
+
+def test_resolve_port(monkeypatch):
+    monkeypatch.delenv("PORT", raising=False)
+    assert http_transport.resolve_port(None) == 8770
+    monkeypatch.setenv("PORT", "4321")
+    assert http_transport.resolve_port(None) == 4321
+    assert http_transport.resolve_port(9000) == 9000  # --port wins
+    for bad, msg in (("http", "not a port"), ("0", "out of range"), ("70000", "out of range")):
+        monkeypatch.setenv("PORT", bad)
+        with pytest.raises(ValueError, match=msg):
+            http_transport.resolve_port(None)
+
+
+def test_healthz_needs_no_token_and_reveals_nothing():
+    with TestClient(_fresh_app(token=STRONG), base_url=LOCAL) as client:
+        r = client.get("/healthz")
+        assert (r.status_code, r.text) == (200, "ok")
+        assert client.get("/healthz/x").status_code == 401  # only the exact path
+        assert client.post("/mcp", headers=HEADERS, json=_rpc("ping")).status_code == 401
 
 
 @pytest.mark.parametrize(
@@ -182,13 +206,14 @@ class TestServeCli:
 
     def test_http_defaults(self, monkeypatch):
         monkeypatch.delenv(http_transport.ENV_TOKEN, raising=False)
+        monkeypatch.delenv("PORT", raising=False)
         calls = self._run(monkeypatch, ["--transport", "http"])
         assert calls == [
             {"transport": "http", "host": "127.0.0.1", "port": 8770, "path": "/mcp", "token": None}
         ]
 
     def test_http_options_and_env_token(self, monkeypatch):
-        monkeypatch.setenv(http_transport.ENV_TOKEN, "abc")
+        monkeypatch.setenv(http_transport.ENV_TOKEN, STRONG)
         calls = self._run(
             monkeypatch,
             [
@@ -203,8 +228,32 @@ class TestServeCli:
             ],
         )
         assert calls == [
-            {"transport": "http", "host": "0.0.0.0", "port": 9001, "path": "/x", "token": "abc"}
+            {"transport": "http", "host": "0.0.0.0", "port": 9001, "path": "/x", "token": STRONG}
         ]
+
+    def test_port_from_env_and_bad_port(self, monkeypatch, capsys):
+        monkeypatch.delenv(http_transport.ENV_TOKEN, raising=False)
+        monkeypatch.setenv("PORT", "5555")
+        assert self._run(monkeypatch, ["--transport", "http"])[0]["port"] == 5555
+        monkeypatch.setenv("PORT", "nope")
+        with pytest.raises(SystemExit) as e:
+            self._run(monkeypatch, ["--transport", "http"])
+        assert e.value.code == 2 and "not a port" in capsys.readouterr().err
+
+    def test_public_bind_with_weak_token_exits(self, monkeypatch, capsys):
+        monkeypatch.setenv(http_transport.ENV_TOKEN, "password")
+        with pytest.raises(SystemExit) as e:
+            self._run(monkeypatch, ["--transport", "http", "--host", "0.0.0.0"])
+        assert e.value.code == 2 and "at least 32" in capsys.readouterr().err
+
+    def test_no_playback_flag_sets_env(self, monkeypatch):
+        # setenv (not delenv) so monkeypatch records the variable and removes the
+        # value the CLI writes straight into os.environ when the test ends.
+        monkeypatch.setenv(server.ENV_NO_PLAYBACK, "0")
+        self._run(monkeypatch, ["--no-playback"])
+        import os
+
+        assert os.environ.get(server.ENV_NO_PLAYBACK) == "1"
 
     def test_public_bind_without_token_exits(self, monkeypatch, capsys):
         monkeypatch.delenv(http_transport.ENV_TOKEN, raising=False)

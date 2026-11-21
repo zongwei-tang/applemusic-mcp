@@ -67,6 +67,22 @@ def normalize_path(path: str | None) -> str:
     return p.rstrip("/") or DEFAULT_PATH
 
 
+def resolve_port(cli_port: int | None) -> int:
+    """``--port``, else ``$PORT`` (set by Railway, Render, Fly and most PaaS), else 8770."""
+    if cli_port:
+        return cli_port
+    env = os.environ.get("PORT", "").strip()
+    if not env:
+        return DEFAULT_PORT
+    try:
+        port = int(env)
+    except ValueError:
+        raise ValueError(f"PORT={env!r} is not a port number") from None
+    if not 0 < port < 65536:
+        raise ValueError(f"PORT={env!r} is out of range")
+    return port
+
+
 def resolve_token(cli_token: str | None) -> str | None:
     """The bearer token from ``--token`` or the environment; empty means none."""
     token = cli_token if cli_token is not None else os.environ.get(ENV_TOKEN, "")
@@ -94,6 +110,32 @@ def security_settings(host: str):
             allowed_origins=[f"http://{n}:*" for n in names],
         )
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
+HEALTH_PATH = "/healthz"
+
+
+class HealthCheck:
+    """``GET /healthz`` → 200 ``ok`` without auth, for a platform's health probe.
+
+    It reveals nothing beyond "the process is up"; every other path goes on to
+    the wrapped app (and its bearer check)."""
+
+    def __init__(self, app: Any):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path") == HEALTH_PATH:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-type", b"text/plain"), (b"content-length", b"2")],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"ok"})
+            return
+        await self.app(scope, receive, send)
 
 
 class BearerAuth:
@@ -152,16 +194,30 @@ def build_app(
         mcp.settings.streamable_http_path = path
         mcp.settings.transport_security = sec
         app = mcp.streamable_http_app()
-    return BearerAuth(app, token) if token else app
+    return HealthCheck(BearerAuth(app, token) if token else app)
+
+
+MIN_PUBLIC_TOKEN_LEN = 32
 
 
 def check_bind(host: str, token: str | None) -> None:
-    """Refuse to expose the server beyond this machine without a token."""
-    if not is_loopback(host) and not token:
+    """Refuse to expose the server beyond this machine without a strong token.
+
+    Off loopback the token is the only guard, so a short or guessable one is
+    refused too (``openssl rand -hex 32`` gives 64 characters)."""
+    if is_loopback(host):
+        return
+    if not token:
         raise ValueError(
             f"refusing to listen on {host} without a bearer token: anyone who can reach "
             f"this address could control your library. Set {ENV_TOKEN} (or --token), "
             "or bind 127.0.0.1."
+        )
+    if len(token) < MIN_PUBLIC_TOKEN_LEN:
+        raise ValueError(
+            f"refusing to listen on {host} with a {len(token)}-character bearer token; "
+            f"use at least {MIN_PUBLIC_TOKEN_LEN} random characters "
+            "(e.g. `openssl rand -hex 32`)."
         )
 
 

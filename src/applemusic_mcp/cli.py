@@ -291,6 +291,40 @@ def cmd_status(args):
     return 0
 
 
+def cmd_export_token(args):
+    """Hand the signed-in media-user-token to a cloud deployment.
+
+    Copies it to the clipboard (macOS ``pbcopy``) so it never lands in the
+    terminal's scrollback or shell history; ``--print`` writes it to stdout for
+    other systems. Paste it into the host's secret store as APPLEMUSIC_USER_TOKEN."""
+    import subprocess
+
+    try:
+        token = get_user_token()
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    if getattr(args, "print_token", False):
+        print(token)
+        return 0
+    try:
+        subprocess.run(["pbcopy"], input=token.encode(), check=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(
+            f"Couldn't copy to the clipboard ({e}). Re-run with --print to write it to stdout.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"Copied your Apple Music user token ({len(token)} characters) to the clipboard.\n"
+        "Paste it into your host's secret store as APPLEMUSIC_USER_TOKEN (on Railway: a\n"
+        "sealed variable), then clear the clipboard. It grants read/write access to your\n"
+        "Apple Music library and lasts about six months.",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def cmd_serve(args):
     """Start the MCP server at the permission level the client config asked for."""
     import os
@@ -307,6 +341,8 @@ def cmd_serve(args):
         os.environ[capabilities.ENV_LEVEL] = level.strip().lower()
     if getattr(args, "allow_ui", False):
         os.environ[capabilities.ENV_UI] = "1"
+    if getattr(args, "no_playback", False):
+        os.environ["APPLEMUSIC_NO_PLAYBACK"] = "1"
 
     from . import http_transport
 
@@ -321,7 +357,11 @@ def cmd_serve(args):
         main()
         return
     host = getattr(args, "host", None) or http_transport.DEFAULT_HOST
-    port = getattr(args, "port", None) or http_transport.DEFAULT_PORT
+    try:
+        port = http_transport.resolve_port(getattr(args, "port", None))
+    except ValueError as e:
+        print(f"applemusic-mcp: {e}", file=sys.stderr)
+        sys.exit(2)
     path = http_transport.normalize_path(getattr(args, "path", None))
     token = http_transport.resolve_token(getattr(args, "token", None))
     try:
@@ -353,7 +393,14 @@ def main():
         "Streamable HTTP server that clients connect to by URL)",
     )
     serve.add_argument("--host", help="HTTP bind address (default 127.0.0.1, local only)")
-    serve.add_argument("--port", type=int, help="HTTP port (default 8770)")
+    serve.add_argument("--port", type=int, help="HTTP port (default $PORT, else 8770)")
+    serve.add_argument(
+        "--no-playback",
+        action="store_true",
+        dest="no_playback",
+        help="Hide the playback and queue tools (a library/playlist-only server, e.g. "
+        "in the cloud). Same as APPLEMUSIC_NO_PLAYBACK=1.",
+    )
     serve.add_argument("--path", help="HTTP endpoint path (default /mcp)")
     serve.add_argument(
         "--token",
@@ -388,6 +435,14 @@ def main():
     signin.add_argument("--days", type=int, default=180)
     signin.add_argument("--port", type=int, default=8765)
 
+    export = sub.add_parser(
+        "export-token",
+        help="Copy your Apple Music user token to the clipboard, for a cloud deployment",
+    )
+    export.add_argument(
+        "--print", action="store_true", dest="print_token", help="Write it to stdout instead"
+    )
+
     sub.add_parser("logout", help="Sign out (switch accounts)")
     sub.add_parser("status", help="Show auth status")
     reset = sub.add_parser("reset", help="Wipe all credentials (keeps your .p8 key file)")
@@ -405,6 +460,8 @@ def main():
         sys.exit(cmd_login(args))
     elif args.command == "logout":
         sys.exit(cmd_logout(args))
+    elif args.command == "export-token":
+        sys.exit(cmd_export_token(args))
     elif args.command == "status":
         sys.exit(cmd_status(args))
     elif args.command == "reset":
