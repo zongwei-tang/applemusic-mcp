@@ -10,6 +10,8 @@ permissions:
 jobs:
   release:
     name: Tag + GitHub Release on version bump
+    # Upstream's releases only; a fork must not tag or dispatch publish.yml.
+    if: github.repository == 'epheterson/applemusic-mcp'
     runs-on: ubuntu-latest
     permissions:
       contents: write  # create tags and releases

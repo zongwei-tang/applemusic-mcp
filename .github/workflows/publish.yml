@@ -21,6 +21,8 @@ permissions:
 jobs:
   build:
     name: Build sdist + wheel
+    # Upstream's PyPI and MCP Registry release only; never from a fork.
+    if: github.repository == 'epheterson/applemusic-mcp'
     runs-on: ubuntu-latest
     permissions:
       contents: read

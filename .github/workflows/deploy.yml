@@ -1,0 +1,56 @@
+name: deploy
+
+# Deploys main to Railway with the Railway CLI. The Railway service has no
+# GitHub source connected, so Railway posts no GitHub deployments and the
+# service URL never appears on the repository page.
+#
+# Needs two repository secrets:
+#   RAILWAY_TOKEN       a Railway project token for the production environment
+#   RAILWAY_SERVICE_ID  the id of the Railway service to deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "tests/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: railway-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Railway
+    if: github.repository == 'zongwei-tang/applemusic-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install the Railway CLI
+        run: npm install --global --no-fund --no-audit @railway/cli@5.75.0 > /dev/null
+
+      # Actions logs are public on a public repository, and the CLI prints
+      # dashboard links with project and service ids, so its output is
+      # discarded. Read build logs in the Railway dashboard instead.
+      - name: Deploy
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ] || [ -z "$RAILWAY_SERVICE_ID" ]; then
+            echo "RAILWAY_TOKEN or RAILWAY_SERVICE_ID is not set." >&2
+            exit 1
+          fi
+          if railway up --ci --service "$RAILWAY_SERVICE_ID" > /dev/null 2>&1; then
+            echo "Deployed."
+          else
+            echo "Deploy failed. See the deployment in the Railway dashboard." >&2
+            exit 1
+          fi
