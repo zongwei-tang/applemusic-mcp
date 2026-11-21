@@ -83,10 +83,15 @@ def security_settings(host: str):
     from mcp.server.transport_security import TransportSecuritySettings
 
     if is_loopback(host):
+        names = ["127.0.0.1", "localhost", "[::1]"]
+        bare = host.strip().strip("[]").lower()
+        bound = f"[{bare}]" if ":" in bare else bare
+        if bound not in names:  # e.g. 127.0.0.2: allow the address the server is on
+            names.append(bound)
         return TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"],
-            allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+            allowed_hosts=[f"{n}:*" for n in names],
+            allowed_origins=[f"http://{n}:*" for n in names],
         )
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 

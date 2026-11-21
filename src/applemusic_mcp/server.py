@@ -6499,25 +6499,45 @@ _CATALOG_PLAYLIST_URL_RE = re.compile(
 )
 
 
-def _resolve_catalog_playlist(value: str) -> tuple[Optional[str], str, Optional[str]]:
-    """A catalog playlist id, URL or name → (id, storefront, error).
+def _resolve_catalog_playlist(
+    value: str, strict: bool = False
+) -> tuple[Optional[str], str, Optional[str], bool]:
+    """A catalog playlist id, URL or name → (id, storefront, error, approximate).
 
     A URL carries its own storefront; an id or name uses the configured one. A
-    name is searched in the catalog: an exact (normalized) title wins, then the
-    first loose match, then Apple's top result."""
+    name is searched in the catalog and an exact (normalized) title wins. Without
+    one, a read takes the first loose match, then Apple's top result, and flags it
+    ``approximate``. With ``strict`` (any write) nothing is guessed: the call is
+    refused and the closest candidates are listed with their ids."""
     value = (value or "").strip()
     storefront = get_storefront()
     if not value:
-        return None, storefront, "playlist required (a pl. id, a music.apple.com URL, or a name)"
+        return (
+            None,
+            storefront,
+            "playlist required (a pl. id, a music.apple.com URL, or a name)",
+            False,
+        )
     m = _CATALOG_PLAYLIST_URL_RE.search(value)
     if m:
-        return m.group("id"), m.group("sf").lower(), None
+        return m.group("id"), m.group("sf").lower(), None, False
+    if "music.apple.com" in value.lower():
+        return (
+            None,
+            storefront,
+            f"not a catalog playlist URL: {value} (expected music.apple.com/<storefront>/"
+            "playlist/…/pl.…). A library playlist is read with playlist(action='tracks').",
+            False,
+        )
     if _CATALOG_PLAYLIST_ID_RE.match(value):
-        return value, storefront, None
+        return value, storefront, None, False
     if value.startswith("p.") or value.startswith("l."):
-        return None, storefront, (
+        return (
+            None,
+            storefront,
             f"{value} is a playlist in your library, not the catalog — use "
-            "playlist(action='tracks') for it"
+            "playlist(action='tracks') for it",
+            False,
         )
     response = requests.get(
         f"{BASE_URL}/catalog/{storefront}/search",
@@ -6528,16 +6548,25 @@ def _resolve_catalog_playlist(value: str) -> tuple[Optional[str], str, Optional[
     response.raise_for_status()
     found = response.json().get("results", {}).get("playlists", {}).get("data", [])
     if not found:
-        return None, storefront, f"No catalog playlist found for: {value}"
+        return None, storefront, f"No catalog playlist found for: {value}", False
     want = _normalize_for_match(value)
     names = [(p, p.get("attributes", {}).get("name", "")) for p in found]
     for p, name in names:
         if _normalize_for_match(name) == want:
-            return p.get("id"), storefront, None
+            return p.get("id"), storefront, None, False
+    if strict:
+        options = "; ".join(f"{name} ({p.get('id')})" for p, name in names[:3])
+        return (
+            None,
+            storefront,
+            f"no catalog playlist is named exactly '{value}'. Closest: {options}. "
+            "Pass the id you mean.",
+            False,
+        )
     for p, name in names:
         if _loose_contains(value, name):
-            return p.get("id"), storefront, None
-    return found[0].get("id"), storefront, None
+            return p.get("id"), storefront, None, True
+    return found[0].get("id"), storefront, None, True
 
 
 def _catalog_playlist_tracks(
@@ -6552,7 +6581,7 @@ def _catalog_playlist_tracks(
     if not capabilities.current().network:
         return "Error: " + capabilities.denied_message("Reading a catalog playlist", "api")
     try:
-        playlist_id, storefront, error = _resolve_catalog_playlist(playlist)
+        playlist_id, storefront, error, approximate = _resolve_catalog_playlist(playlist)
         if error:
             return f"Error: {error}"
         headers = get_headers()
@@ -6604,6 +6633,8 @@ def _catalog_playlist_tracks(
         if format != "text":
             return body
         header = [f"=== {attrs.get('name', playlist_id)} ==="]
+        if approximate:
+            header.append(f"(Closest match for '{playlist}'; no playlist has exactly that name.)")
         if attrs.get("curatorName"):
             header.append(f"Curator: {attrs['curatorName']}")
         header.append(f"Catalog playlist id: {playlist_id} ({len(songs)} songs)")
@@ -6633,7 +6664,7 @@ def _library_add_catalog_playlist(playlist: str) -> str:
             "(browser sign-in, no Apple Developer account) or `applemusic-mcp login --dev`."
         )
     try:
-        playlist_id, _sf, error = _resolve_catalog_playlist(playlist)
+        playlist_id, _sf, error, _approx = _resolve_catalog_playlist(playlist, strict=True)
     except requests.exceptions.RequestException as e:
         return _api_error(e)
     except (FileNotFoundError, ValueError) as e:

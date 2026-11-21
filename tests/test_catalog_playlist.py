@@ -69,14 +69,14 @@ def _mock_playlist(pl_id=PL, sf="us", pages=((0, 2),), with_video=False):
 
 class TestResolveCatalogPlaylist:
     def test_bare_id(self, tokens):
-        assert server._resolve_catalog_playlist(PL) == (PL, "us", None)
+        assert server._resolve_catalog_playlist(PL) == (PL, "us", None, False)
 
     def test_shared_user_id(self, tokens):
         assert server._resolve_catalog_playlist("pl.u-abc123")[0] == "pl.u-abc123"
 
     def test_url_carries_storefront(self, tokens):
         url = f"https://music.apple.com/jp/playlist/todays-hits/{PL}?l=en"
-        assert server._resolve_catalog_playlist(url) == (PL, "jp", None)
+        assert server._resolve_catalog_playlist(url) == (PL, "jp", None, False)
 
     def test_url_without_slug(self, tokens):
         assert server._resolve_catalog_playlist(f"music.apple.com/GB/playlist/{PL}")[:2] == (
@@ -85,12 +85,12 @@ class TestResolveCatalogPlaylist:
         )
 
     def test_empty(self, tokens):
-        pid, _, err = server._resolve_catalog_playlist("  ")
+        pid, _, err, _ = server._resolve_catalog_playlist("  ")
         assert pid is None and "required" in err
 
     @pytest.mark.parametrize("lib_id", ["p.abc123", "l.xyz"])
     def test_library_id_is_redirected(self, tokens, lib_id):
-        pid, _, err = server._resolve_catalog_playlist(lib_id)
+        pid, _, err, _ = server._resolve_catalog_playlist(lib_id)
         assert pid is None and "playlist(action='tracks')" in err
 
     def _search(self, *names):
@@ -109,27 +109,48 @@ class TestResolveCatalogPlaylist:
             },
         )
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://music.apple.com/us/library/playlist/p.abc123",
+            "https://music.apple.com/us/album/some-album/123456",
+        ],
+    )
+    def test_other_apple_music_urls_are_not_searched(self, tokens, url):
+        pid, _, err, _ = server._resolve_catalog_playlist(url)
+        assert pid is None and "not a catalog playlist URL" in err
+
     @resp_lib.activate
     def test_name_exact_beats_loose(self, tokens):
         self._search("Chill Mix Deluxe", "Chill Mix")
-        assert server._resolve_catalog_playlist("chill mix")[0] == "pl.1"
+        assert server._resolve_catalog_playlist("chill mix")[:2] == ("pl.1", "us")
+        assert server._resolve_catalog_playlist("chill mix", strict=True)[0] == "pl.1"
         qs = parse_qs(urlsplit(resp_lib.calls[0].request.url).query)
         assert qs["types"] == ["playlists"]
 
     @resp_lib.activate
     def test_name_loose_then_top(self, tokens):
         self._search("Something Else", "Workout Chill Mix")
-        assert server._resolve_catalog_playlist("chill mix")[0] == "pl.1"
+        pid, _, err, approximate = server._resolve_catalog_playlist("chill mix")
+        assert (pid, err, approximate) == ("pl.1", None, True)
 
     @resp_lib.activate
     def test_name_falls_back_to_top_result(self, tokens):
         self._search("Zzz", "Yyy")
-        assert server._resolve_catalog_playlist("chill mix")[0] == "pl.0"
+        assert server._resolve_catalog_playlist("chill mix")[::3] == ("pl.0", True)
+
+    @resp_lib.activate
+    def test_strict_refuses_without_exact_name(self, tokens):
+        self._search("Workout Chill Mix", "Chill Mixtape", "Zzz", "Extra")
+        pid, _, err, _ = server._resolve_catalog_playlist("chill mix", strict=True)
+        assert pid is None
+        assert "Workout Chill Mix (pl.0)" in err and "Zzz (pl.2)" in err
+        assert "Extra" not in err
 
     @resp_lib.activate
     def test_name_not_found(self, tokens):
         resp_lib.add(resp_lib.GET, f"{BASE}/catalog/us/search", json={"results": {}})
-        pid, _, err = server._resolve_catalog_playlist("nothing")
+        pid, _, err, _ = server._resolve_catalog_playlist("nothing")
         assert pid is None and "No catalog playlist" in err
 
 
@@ -252,3 +273,40 @@ class TestLibraryAddPlaylist:
             r.add(resp_lib.POST, f"{BASE}/me/library", status=204)
             ok, msg = server._add_to_library_api([PL], "playlists")
         assert ok and "playlist(s)" in msg
+
+
+def _search_results(*pairs):
+    return {
+        "results": {
+            "playlists": {"data": [{"id": pid, "attributes": {"name": n}} for pid, n in pairs]}
+        }
+    }
+
+
+@resp_lib.activate
+def test_read_by_inexact_name_is_labelled(tokens):
+    resp_lib.add(
+        resp_lib.GET, f"{BASE}/catalog/us/search", json=_search_results((PL, "Today's Hits"))
+    )
+    _mock_playlist()
+    out = server.catalog(action="playlist_tracks", playlist="hits")
+    assert "Closest match for 'hits'" in out and "Song 0" in out
+
+
+@resp_lib.activate
+def test_add_by_inexact_name_writes_nothing(tokens):
+    resp_lib.add(
+        resp_lib.GET, f"{BASE}/catalog/us/search", json=_search_results((PL, "Today's Hits"))
+    )
+    out = server.library(action="add", playlist="hits")
+    assert out.startswith("Error:") and f"Today's Hits ({PL})" in out
+    assert all(c.request.method == "GET" for c in resp_lib.calls)
+
+
+@resp_lib.activate
+def test_add_by_exact_name(tokens):
+    resp_lib.add(
+        resp_lib.GET, f"{BASE}/catalog/us/search", json=_search_results((PL, "Today's Hits"))
+    )
+    resp_lib.add(resp_lib.POST, f"{BASE}/me/library", status=202)
+    assert "Added catalog playlist" in server.library(action="add", playlist="today's hits")

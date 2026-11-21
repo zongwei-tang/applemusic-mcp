@@ -41,7 +41,7 @@ claude mcp add --transport http "Apple Music" http://127.0.0.1:8770/mcp \
   --header "Authorization: Bearer $APPLEMUSIC_MCP_TOKEN"
 ```
 
-Cursor, Windsurf and other clients that accept a URL take `{"mcpServers": {"Apple Music": {"url": "http://127.0.0.1:8770/mcp"}}}`, with a `headers` object for the token. Claude Desktop's `claude_desktop_config.json` only launches local stdio servers, so keep the stdio config there; it shares the same sign-in and settings with an HTTP server.
+Cursor, Windsurf and other clients that accept a URL take `{"mcpServers": {"Apple Music": {"url": "http://127.0.0.1:8770/mcp"}}}`, with a `headers` object for the token. If a client's config only takes a `command` (like `claude_desktop_config.json`), keep the stdio setup there; it shares the same sign-in and settings with an HTTP server.
 
 **macOS permissions follow the process that runs the server.** Under stdio, the Automation and Accessibility prompts name your MCP client. An HTTP server started from Terminal asks for Terminal instead; one started by launchd asks for the Python binary. Grant them once in System Settings → Privacy & Security.
 

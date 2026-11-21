@@ -249,3 +249,13 @@ def test_tool_calls_are_serialized():
     assert done.wait(5)
     h.join(5)
     c.join(5)
+
+
+def test_other_loopback_bind_address_is_reachable():
+    sec = http_transport.security_settings("127.0.0.2")
+    assert "127.0.0.2:*" in sec.allowed_hosts and "http://127.0.0.2:*" in sec.allowed_origins
+    assert "[::1]:*" in http_transport.security_settings("[::1]").allowed_hosts
+    assert len(http_transport.security_settings("localhost").allowed_hosts) == 3
+    with TestClient(_fresh_app(host="127.0.0.2"), base_url="http://127.0.0.2:8770") as client:
+        _, listed = _handshake(client)
+    assert listed["result"]["tools"]
