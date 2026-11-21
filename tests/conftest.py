@@ -24,7 +24,7 @@ def _reset_throttle_state():
 
 
 @pytest.fixture(autouse=True)
-def _block_external_network(request):
+def _block_external_network(request, monkeypatch):
     """Hard guarantee: no test outside the explicit live gates (`ui` / `ui_live`)
     may open a real external socket. Apple's API is external, so this proves the
     mocked suite never touches the real account — a stray un-mocked amp-api call
@@ -33,6 +33,14 @@ def _block_external_network(request):
     if request.node.get_closest_marker("ui") or request.node.get_closest_marker("ui_live"):
         yield
         return
+
+    # With a proxy configured, requests opens its socket to the proxy (often on
+    # localhost), so the guard below would see an allowed host while the request
+    # still reached Apple through the proxy. Drop the proxy so the guard sees the
+    # real destination.
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv(var.lower(), raising=False)
 
     def _guard(self, address, *args, **kwargs):
         host = address[0] if isinstance(address, tuple) else address
@@ -318,3 +326,16 @@ def mock_api_headers(mock_developer_token, mock_user_token):
         "Music-User-Token": mock_user_token,
         "Content-Type": "application/json",
     }
+
+
+@pytest.fixture
+def chrome_signin_path(monkeypatch):
+    """Route `signin` to the Chrome branch regardless of the host: the Safari
+    harvest fails and Playwright reports present. Without this, a Mac without the
+    `browser` extra falls through to the "install Playwright" message and any
+    test that stubs `browser.signin_interactive` never reaches its stub."""
+    import applemusic_mcp.browser as browser
+    from applemusic_mcp import safari
+
+    monkeypatch.setattr(safari, "media_user_token", lambda: (False, "no safari session"))
+    monkeypatch.setattr(browser, "is_available", lambda: True)

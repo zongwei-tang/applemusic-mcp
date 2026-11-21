@@ -307,9 +307,29 @@ def cmd_serve(args):
         os.environ[capabilities.ENV_LEVEL] = level.strip().lower()
     if getattr(args, "allow_ui", False):
         os.environ[capabilities.ENV_UI] = "1"
+
+    from . import http_transport
+
+    try:
+        transport = http_transport.normalize_transport(getattr(args, "transport", None))
+    except ValueError as e:
+        print(f"applemusic-mcp: {e}", file=sys.stderr)
+        sys.exit(2)
     from .server import main
 
-    main()
+    if transport == "stdio":
+        main()
+        return
+    host = getattr(args, "host", None) or http_transport.DEFAULT_HOST
+    port = getattr(args, "port", None) or http_transport.DEFAULT_PORT
+    path = http_transport.normalize_path(getattr(args, "path", None))
+    token = http_transport.resolve_token(getattr(args, "token", None))
+    try:
+        http_transport.check_bind(host, token)
+    except ValueError as e:
+        print(f"applemusic-mcp: {e}", file=sys.stderr)
+        sys.exit(2)
+    main(transport="http", host=host, port=port, path=path, token=token)
 
 
 def main():
@@ -325,6 +345,20 @@ def main():
     )
     serve.add_argument(
         "--allow-ui", action="store_true", help="Allow Accessibility UI scripting (clicks)"
+    )
+    serve.add_argument(
+        "--transport",
+        default="stdio",
+        help="stdio (default: the client spawns this process) or http (a long-running "
+        "Streamable HTTP server that clients connect to by URL)",
+    )
+    serve.add_argument("--host", help="HTTP bind address (default 127.0.0.1, local only)")
+    serve.add_argument("--port", type=int, help="HTTP port (default 8770)")
+    serve.add_argument("--path", help="HTTP endpoint path (default /mcp)")
+    serve.add_argument(
+        "--token",
+        help="HTTP bearer token clients must send (prefer the APPLEMUSIC_MCP_TOKEN env "
+        "var, which stays out of the process list). Required for a non-loopback --host.",
     )
 
     login = sub.add_parser("login", help="Sign in (web flow; --dev for an Apple Developer token)")

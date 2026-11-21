@@ -634,7 +634,7 @@ class TestAuthTool:
         out = server.config(action="status")
         assert "signin" in out.lower()
 
-    def test_signin_success(self, monkeypatch):
+    def test_signin_success(self, monkeypatch, chrome_signin_path):
         import applemusic_mcp.browser as browser
 
         monkeypatch.setattr(

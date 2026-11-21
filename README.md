@@ -47,6 +47,7 @@ What each engine can do, and the level that turns it on. `✓` supported, `✗` 
 |Favorites list|✓|✗|✗|
 |**Playlist** create / add / remove / rename|✓|✓|—|
 |Playlist copy|✓|✗|—|
+|Catalog playlists: read tracks / save to library|✗|✓|—|
 |Playlist delete|✓|✓ (web token)|—|
 |Folders: single level + move in/out|✓|✓|—|
 |Folders: nested paths / tree / `path`|✓|✗|✗|
@@ -93,6 +94,17 @@ playwright install chromium        # the Chrome web player: Windows/Linux, or a 
 
 Change `music` to `api` or `web` to [unlock more](#choose-how-much-it-can-reach); on Windows or Linux start at `api`, since `music` needs a Mac. Config file locations, the Chrome web player on a Mac, and source installs: [configuration](https://github.com/epheterson/applemusic-mcp/blob/main/docs/configuration.md).
 
+### Run it over HTTP instead of stdio
+
+By default the client starts the server as a child process and talks to it over stdio. To run one long-lived server that clients reach by URL, use the Streamable HTTP transport:
+
+```bash
+applemusic-mcp serve --transport http --level music        # http://127.0.0.1:8770/mcp
+claude mcp add --transport http "Apple Music" http://127.0.0.1:8770/mcp
+```
+
+It listens on 127.0.0.1 only and rejects requests whose `Host` or `Origin` isn't local, which blocks DNS-rebinding attacks from web pages. Set `APPLEMUSIC_MCP_TOKEN` to require `Authorization: Bearer <token>` on every request; binding any other address (`--host 0.0.0.0`) refuses to start without one. `--port` and `--path` change the URL. Over HTTP, `--level` is set once for the server and applies to every client that connects. Details: [configuration](docs/configuration.md#http-transport).
+
 Restart your client and try *"List my Apple Music playlists"* or *"Play my favorites."* On macOS the local library and playback work immediately. To add catalog music or run on any OS, sign in.
 
 ### Sign in
@@ -113,8 +125,8 @@ Seven action-based tools keep the MCP context small. Each takes an `action` and 
 | Tool | Actions |
 |---|---|
 | `playlist` | list, folders, tracks, search, create, add, copy, move, remove, delete, rename, path (playlists and folders) |
-| `library` | search, add, browse, favorites, recently_played, recently_added, rate, remove, snapshot |
-| `catalog` | search, resolve, album_tracks, album_details, song_details, artist_details, genres, suggestions |
+| `library` | search, add (songs, albums, or a whole catalog playlist), browse, favorites, recently_played, recently_added, rate, remove, snapshot |
+| `catalog` | search, resolve, album_tracks, album_details, playlist_tracks (Apple's editorial and shared playlists), song_details, artist_details, genres, suggestions |
 | `discover` | recommendations, heavy_rotation, charts, top_songs, similar_artists, personal_station, song_station |
 | `playback` | play (track / album / playlist / URL), control, now_playing, settings, reveal, airplay |
 | `queue` | list, set, play_next, play_last, remove, jump, clear, autoplay (Up Next — Safari on macOS, Chrome elsewhere; `engine=` to pick) |
@@ -126,6 +138,7 @@ Batching, importing playlists, dry runs, export formats and storefronts: [usage 
 
 ```bash
 applemusic-mcp serve --level music   # run the MCP server (your client calls this)
+applemusic-mcp serve --transport http # long-running Streamable HTTP server on 127.0.0.1:8770/mcp
 applemusic-mcp login                 # web sign-in (macOS: Safari; Windows/Linux: Chrome)
 applemusic-mcp login --chrome        # use the Chrome web player on a Mac
 applemusic-mcp login --dev           # your own Apple developer token (.p8)

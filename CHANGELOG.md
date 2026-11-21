@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Streamable HTTP transport.** `serve --transport http` runs one long-lived server at `http://127.0.0.1:8770/mcp` that clients reach by URL. It binds loopback by default with DNS-rebinding protection on, takes an optional bearer token (`APPLEMUSIC_MCP_TOKEN` or `--token`), and refuses a non-loopback `--host` without one. Works on mcp 1.x and 2.x.
+- **Catalog playlists.** `catalog(action='playlist_tracks')` lists the songs in an Apple editorial or shared playlist, by `pl.` id, music.apple.com URL or name. `library(action='add', playlist=...)` saves one to your library.
+
+### Fixed
+
+- **Tests:** the guard against real network calls in the mocked suite was bypassed when an HTTP proxy was set, because the socket went to the proxy on localhost. Proxy variables are now cleared for non-live tests.
+- **Tests:** four sign-in tests failed on a Mac without the `browser` extra; they now pin the Chrome path themselves.
+
 ## [0.22.1] - 2026-11-07
 
 `playlist copy` on macOS is fast and exact, library songs add over the web API again, and `login` waits for you to sign in.

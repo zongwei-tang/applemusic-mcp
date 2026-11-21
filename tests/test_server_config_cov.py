@@ -1025,7 +1025,7 @@ class TestClearCredentials:
 
 
 class TestAuthActionGaps:
-    def test_signin_exception_returns_error(self, monkeypatch):
+    def test_signin_exception_returns_error(self, monkeypatch, chrome_signin_path):
         """signin_interactive raises → 'Error: ...'."""
         import applemusic_mcp.browser as browser
 
@@ -1086,7 +1086,7 @@ class TestAuthActionGaps:
         assert "Unknown action" in out
         assert "teleport" in out
 
-    def test_login_alias(self, monkeypatch):
+    def test_login_alias(self, monkeypatch, chrome_signin_path):
         """'login' is an alias for 'signin'."""
         import applemusic_mcp.browser as browser
 
@@ -1094,7 +1094,7 @@ class TestAuthActionGaps:
         out = server._auth_action("login")
         assert "✓" in out
 
-    def test_config_action_login_alias(self, monkeypatch):
+    def test_config_action_login_alias(self, monkeypatch, chrome_signin_path):
         """config(action='login') routes to signin."""
         import applemusic_mcp.browser as browser
 

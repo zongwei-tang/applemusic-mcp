@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -917,22 +918,31 @@ except TypeError:  # mcp 1.x
     mcp = FastMCP("Apple Music")
 
 
+_TOOL_CALL_LOCK = threading.RLock()
+
+
 def _tool(*args, **kwargs):
     """``mcp.tool`` that answers a permission-level refusal as tool text.
 
     A visible tool can still have an action its level can't run (an API-only
     browse at ``music``); the refusal raised deep inside becomes a normal
     "Error: ..." reply instead of a protocol error. The module-level name stays
-    the plain function, so direct calls behave as before."""
+    the plain function, so direct calls behave as before.
+
+    Calls are also serialized. mcp 1.x runs a sync tool on the event loop, so
+    calls never overlapped; mcp 2.x runs each on a worker thread, and over HTTP
+    several clients can call at once. Music.app, the browser engine and the
+    track cache all assume one caller, so every major gets the 1.x behavior."""
     register = mcp.tool(*args, **kwargs)
 
     def decorate(fn):
         @functools.wraps(fn)
         def level_safe(*a, **kw):
-            try:
-                return fn(*a, **kw)
-            except capabilities.CapabilityDenied as e:
-                return f"Error: {e}"
+            with _TOOL_CALL_LOCK:
+                try:
+                    return fn(*a, **kw)
+                except capabilities.CapabilityDenied as e:
+                    return f"Error: {e}"
 
         register(level_safe)
         return fn
@@ -2687,7 +2697,7 @@ def _add_to_library_api(catalog_ids: list[str], content_type: str = "songs") -> 
 
     Args:
         catalog_ids: List of catalog IDs
-        content_type: Type of content - "songs" (default) or "albums"
+        content_type: Type of content - "songs" (default), "albums" or "playlists"
 
     Returns:
         Tuple of (success, message)
@@ -2699,9 +2709,10 @@ def _add_to_library_api(catalog_ids: list[str], content_type: str = "songs") -> 
     type_param = {
         "songs": "ids[songs]",
         "albums": "ids[albums]",
+        "playlists": "ids[playlists]",
     }.get(content_type, "ids[songs]")
 
-    type_label = "song" if content_type == "songs" else "album"
+    type_label = {"albums": "album", "playlists": "playlist"}.get(content_type, "song")
 
     try:
         headers = get_headers()
@@ -5418,6 +5429,7 @@ def library(
     track: str = "",
     album: str = "",
     artist: str = "",
+    playlist: str = "",
     limit: int = 25,
     offset: int = 0,
     format: str = "text",
@@ -5429,7 +5441,7 @@ def library(
     rate_action: str = "",
     stars: int = 0,
 ) -> str:
-    """Your library. Actions: search, add, recently_played, recently_added, browse, favorites (macOS), rate, remove, snapshot (macOS). action='search' searches the user's local library only — for catalog (Apple Music's full library) use catalog(action='search'). For search, types can be 'songs' (default), 'artists', 'albums', 'all', or 'genre' — types='genre' lists the user's own tracks whose genre matches query (e.g. query='Rock'); genre filtering is macOS-only (local Music app). Search returns one page: limit (default 25) caps results and offset pages through larger result sets — the text header shows 'start-end of total' so you know when more remain. action='favorites' lists songs marked Favorite (loved) in Music.app. action='add' adds catalog tracks/albums to your library over the API (developer token — generated or harvested — plus a media-user-token from `signin`); there is no UI-automation fallback. In api mode, search/browse read via the API and love/dislike rate via the API; star ratings (rate get/set) need native mode (local Music.app)."""
+    """Your library. Actions: search, add, recently_played, recently_added, browse, favorites (macOS), rate, remove, snapshot (macOS). action='search' searches the user's local library only — for catalog (Apple Music's full library) use catalog(action='search'). For search, types can be 'songs' (default), 'artists', 'albums', 'all', or 'genre' — types='genre' lists the user's own tracks whose genre matches query (e.g. query='Rock'); genre filtering is macOS-only (local Music app). Search returns one page: limit (default 25) caps results and offset pages through larger result sets — the text header shows 'start-end of total' so you know when more remain. action='favorites' lists songs marked Favorite (loved) in Music.app. action='add' adds catalog tracks/albums — or a whole catalog playlist via `playlist` (a pl. id, music.apple.com URL or name; see catalog(action='playlist_tracks')) — to your library over the API (developer token — generated or harvested — plus a media-user-token from `signin`); there is no UI-automation fallback. In api mode, search/browse read via the API and love/dislike rate via the API; star ratings (rate get/set) need native mode (local Music.app)."""
     action = action.lower().strip().replace("-", "_")
 
     if action == "search":
@@ -5439,6 +5451,8 @@ def library(
             query, types, limit, offset, format, export, full, fetch_explicit, clean_only
         )
     elif action == "add":
+        if playlist and not (track or album):
+            return _library_add_catalog_playlist(playlist)
         return _library_add(track, album, artist)
     elif action == "recently_played":
         return _library_recently_played(limit, format, export, full)
@@ -6473,6 +6487,169 @@ def _catalog_album_tracks(
         return _api_error(e)
     except (FileNotFoundError, ValueError) as e:
         return str(e)
+
+
+# Catalog playlists: Apple's editorial lists ("pl.<hex>") and other users' shared
+# lists ("pl.u-<id>"). They live in the catalog, not in the user's library, so the
+# library-playlist tools can't read them.
+_CATALOG_PLAYLIST_ID_RE = re.compile(r"^pl\.[A-Za-z0-9._-]+$")
+_CATALOG_PLAYLIST_URL_RE = re.compile(
+    r"music\.apple\.com/(?P<sf>[a-z]{2})/playlist/(?:[^/?#]+/)?(?P<id>pl\.[A-Za-z0-9._-]+)",
+    re.IGNORECASE,
+)
+
+
+def _resolve_catalog_playlist(value: str) -> tuple[Optional[str], str, Optional[str]]:
+    """A catalog playlist id, URL or name → (id, storefront, error).
+
+    A URL carries its own storefront; an id or name uses the configured one. A
+    name is searched in the catalog: an exact (normalized) title wins, then the
+    first loose match, then Apple's top result."""
+    value = (value or "").strip()
+    storefront = get_storefront()
+    if not value:
+        return None, storefront, "playlist required (a pl. id, a music.apple.com URL, or a name)"
+    m = _CATALOG_PLAYLIST_URL_RE.search(value)
+    if m:
+        return m.group("id"), m.group("sf").lower(), None
+    if _CATALOG_PLAYLIST_ID_RE.match(value):
+        return value, storefront, None
+    if value.startswith("p.") or value.startswith("l."):
+        return None, storefront, (
+            f"{value} is a playlist in your library, not the catalog — use "
+            "playlist(action='tracks') for it"
+        )
+    response = requests.get(
+        f"{BASE_URL}/catalog/{storefront}/search",
+        headers=get_headers(),
+        params={"term": value, "types": "playlists", "limit": 10},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    found = response.json().get("results", {}).get("playlists", {}).get("data", [])
+    if not found:
+        return None, storefront, f"No catalog playlist found for: {value}"
+    want = _normalize_for_match(value)
+    names = [(p, p.get("attributes", {}).get("name", "")) for p in found]
+    for p, name in names:
+        if _normalize_for_match(name) == want:
+            return p.get("id"), storefront, None
+    for p, name in names:
+        if _loose_contains(value, name):
+            return p.get("id"), storefront, None
+    return found[0].get("id"), storefront, None
+
+
+def _catalog_playlist_tracks(
+    playlist: str = "",
+    limit: int = 0,
+    offset: int = 0,
+    format: str = "text",
+    export: str = "none",
+    full: bool = False,
+) -> str:
+    """Internal: list a catalog playlist's details and tracks."""
+    if not capabilities.current().network:
+        return "Error: " + capabilities.denied_message("Reading a catalog playlist", "api")
+    try:
+        playlist_id, storefront, error = _resolve_catalog_playlist(playlist)
+        if error:
+            return f"Error: {error}"
+        headers = get_headers()
+        base = f"{BASE_URL}/catalog/{storefront}/playlists/{playlist_id}"
+        meta = requests.get(base, headers=headers, timeout=REQUEST_TIMEOUT)
+        if meta.status_code == 404:
+            return f"Error: catalog playlist {playlist_id} not found in storefront '{storefront}'"
+        meta.raise_for_status()
+        data = meta.json().get("data", [])
+        attrs = data[0].get("attributes", {}) if data else {}
+
+        all_tracks: list[dict] = []
+        api_offset = 0
+        while True:
+            response = requests.get(
+                f"{base}/tracks",
+                headers=headers,
+                params={"limit": 100, "offset": api_offset},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code == 404:
+                break
+            response.raise_for_status()
+            page = response.json()
+            tracks = page.get("data", [])
+            all_tracks.extend(tracks)
+            if not tracks or not page.get("next"):
+                break
+            api_offset += len(tracks)
+
+        # A playlist can hold music videos too; keep only what plays as a song.
+        songs = [t for t in all_tracks if t.get("type", "songs") == "songs"]
+        if not songs:
+            return f"Catalog playlist {attrs.get('name', playlist_id)} has no songs"
+        track_data = [extract_track_data(t, include_extras=True) for t in songs]
+        track_data, total_count, error = _apply_pagination(track_data, limit, offset)
+        if error:
+            return error
+
+        body = format_output(
+            track_data,
+            format,
+            export,
+            full,
+            f"catalog_playlist_{playlist_id.replace('.', '_').replace('-', '_')}",
+            total_count=total_count,
+            offset=offset,
+        )
+        if format != "text":
+            return body
+        header = [f"=== {attrs.get('name', playlist_id)} ==="]
+        if attrs.get("curatorName"):
+            header.append(f"Curator: {attrs['curatorName']}")
+        header.append(f"Catalog playlist id: {playlist_id} ({len(songs)} songs)")
+        desc = (attrs.get("description") or {}).get("short") or (
+            attrs.get("description") or {}
+        ).get("standard")
+        if desc:
+            header.append(re.sub(r"<[^>]+>", "", desc).strip())
+        header.append(
+            "Save it whole: library(action='add', playlist=<this id>). Or copy songs into "
+            "your own playlist with playlist(action='add', track=<catalog ids>)."
+        )
+        return "\n".join(header) + "\n\n" + body
+    except requests.exceptions.RequestException as e:
+        return _api_error(e)
+    except (FileNotFoundError, ValueError) as e:
+        return str(e)
+
+
+def _library_add_catalog_playlist(playlist: str) -> str:
+    """Save a catalog playlist (editorial or shared) to the user's library."""
+    if not capabilities.current().network:
+        return "Error: " + capabilities.denied_message("Adding to your library", "api")
+    if not _can_use_library_api():
+        return (
+            "Error: Adding to your library needs the API. Run `applemusic-mcp login` "
+            "(browser sign-in, no Apple Developer account) or `applemusic-mcp login --dev`."
+        )
+    try:
+        playlist_id, _sf, error = _resolve_catalog_playlist(playlist)
+    except requests.exceptions.RequestException as e:
+        return _api_error(e)
+    except (FileNotFoundError, ValueError) as e:
+        return str(e)
+    if error:
+        return f"Error: {error}"
+    success, msg = _add_to_library_api([playlist_id], "playlists")
+    if not success:
+        return f"Error: couldn't add catalog playlist {playlist_id}: {msg}"
+    audit_log.log_action(
+        "add_to_library", {"tracks": [f"catalog playlist {playlist_id}"], "via": "api"}
+    )
+    return (
+        f"Added catalog playlist {playlist_id} to your library. It can take a moment to "
+        "appear in playlist(action='list')."
+    )
 
 
 def _catalog_album_details(
@@ -7820,6 +7997,7 @@ def catalog(
     song_id: str = "",
     chart_type: str = "songs",
     term: str = "",
+    playlist: str = "",
     isrcs: str = "",
     tracks: str = "",
     max_tracks: int = 0,
@@ -7830,9 +8008,15 @@ def catalog(
     full: bool = False,
     clean_only: Optional[bool] = None,
 ) -> str:
-    """Apple Music catalog. Actions: search, resolve, album_tracks, album_details, song_details, artist_details, genres, suggestions.
+    """Apple Music catalog. Actions: search, resolve, album_tracks, album_details, playlist_tracks, song_details, artist_details, genres, suggestions.
 
     `search` is discovery: one query in, a ranked list out, for browsing.
+    (types='playlists' finds Apple's editorial and shared playlists.)
+
+    `playlist_tracks` reads a CATALOG playlist — Apple's editorial lists and other
+    people's shared ones, which aren't in the user's library — by `playlist` = a
+    pl. id, a music.apple.com/…/playlist/… URL, or a name. limit/offset page it.
+    Save one whole with library(action='add', playlist=...).
 
     `resolve` is identification: N identifiers in, N verdicts out, writing nothing —
     use it (never repeated `search`) to turn a track list into catalog IDs. It routes
@@ -7892,6 +8076,8 @@ def catalog(
         if not album:
             return "Error: album required for album_details"
         return _catalog_album_details(album, artist, format, export, full)
+    elif action == "playlist_tracks":
+        return _catalog_playlist_tracks(playlist or query, limit, offset, format, export, full)
     elif action == "song_details":
         if not song_id:
             return "Error: song_id required for song_details"
@@ -7907,7 +8093,7 @@ def catalog(
             return "Error: term required for suggestions"
         return _catalog_suggestions(term)
     else:
-        return f"Unknown action: {action}. Use: search, resolve, album_tracks, album_details, song_details, artist_details, genres, suggestions"
+        return f"Unknown action: {action}. Use: search, resolve, album_tracks, album_details, playlist_tracks, song_details, artist_details, genres, suggestions"
 
 
 # ============ SYSTEM MANAGEMENT ============
@@ -10212,8 +10398,14 @@ def apply_level(app) -> list[str]:
     return removed
 
 
-def main():
-    """Run the MCP server."""
+def main(
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8770,
+    path: str = "/mcp",
+    token: Optional[str] = None,
+):
+    """Run the MCP server over stdio (the default) or Streamable HTTP."""
     # pragma: no cover  # entrypoint: starts the MCP server, not exercised under test
     import atexit
     import signal
@@ -10237,6 +10429,15 @@ def main():
         )
     capabilities.install_network_guard()
     apply_level(mcp)
+    if transport == "http":
+        from . import http_transport
+
+        try:
+            http_transport.serve(mcp, host=host, port=port, path=path, token=token)
+        except ValueError as e:  # non-loopback bind without a token
+            print(f"applemusic-mcp: {e}", file=sys.stderr)
+            sys.exit(2)
+        return
     mcp.run()
 
 

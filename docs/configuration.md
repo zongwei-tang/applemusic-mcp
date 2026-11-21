@@ -15,3 +15,35 @@ Four engines back the server. **Native** drives the local Music.app on macOS via
 **Browser (Chrome web player) features** — cross-platform playback + the Up Next queue — need Google Chrome plus Playwright. Off macOS, Playwright is installed by default; **on macOS it's an opt-in extra** (`pip install 'applemusic-mcp[browser]'`) since Safari sign-in + native Music.app playback already cover the Mac. After installing, run the one-time browser download (`playwright install chromium`, or `uvx --from applemusic-mcp playwright install chromium`). The bundled Chromium can't decode Apple's DRM, so a real Chrome install is required, and these features open a local Chrome window (not for headless servers). You don't sign in twice: the web player authorizes off your existing sign-in (the Safari-harvested or developer token is bridged into its profile automatically), so on macOS a single `login` covers the API, native playback, *and* the Chrome web player/queue.
 
 **From source:** `git clone … && pip install -e .`, then point the config `command` at `<repo>/venv/bin/applemusic-mcp` or use `python -m applemusic_mcp`.
+
+## HTTP transport
+
+`applemusic-mcp serve --transport http` serves MCP over [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) instead of stdio. Clients connect to a URL rather than starting the process themselves, several clients can share one server (and one Chrome web player), and the server keeps running when a client quits.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--transport` | `stdio` | `stdio`, or `http` (`streamable-http` also works). SSE is deprecated in MCP and refused. |
+| `--host` | `127.0.0.1` | Bind address. Anything but loopback needs a token. |
+| `--port` | `8770` | TCP port. |
+| `--path` | `/mcp` | Endpoint path. |
+| `--token` | `$APPLEMUSIC_MCP_TOKEN` | Bearer token every request must carry. Prefer the env var: a `--token` value is visible in the process list. |
+| `--level`, `--allow-ui` | as for stdio | Server-wide: every connected client gets the same level. |
+
+**Security.** On a loopback bind the server only answers requests whose `Host` is `127.0.0.1`, `localhost` or `[::1]`, and whose `Origin`, if present, is one of those too. A web page can't reach it by rebinding a hostname to 127.0.0.1, and a cross-site page can't drive it from your browser. Any local program can still connect, the same as it could run `osascript` itself; set a token if that matters to you. On a non-loopback bind the Host check is off (a LAN name for your Mac can't be listed ahead of time), so the token is mandatory and the server refuses to start without one. There is no TLS: put a reverse proxy in front if the traffic leaves the machine.
+
+**Clients.**
+
+```bash
+# Claude Code
+claude mcp add --transport http "Apple Music" http://127.0.0.1:8770/mcp
+# with a token
+claude mcp add --transport http "Apple Music" http://127.0.0.1:8770/mcp \
+  --header "Authorization: Bearer $APPLEMUSIC_MCP_TOKEN"
+```
+
+Cursor, Windsurf and other clients that accept a URL take `{"mcpServers": {"Apple Music": {"url": "http://127.0.0.1:8770/mcp"}}}`, with a `headers` object for the token. Claude Desktop's `claude_desktop_config.json` only launches local stdio servers, so keep the stdio config there; it shares the same sign-in and settings with an HTTP server.
+
+**macOS permissions follow the process that runs the server.** Under stdio, the Automation and Accessibility prompts name your MCP client. An HTTP server started from Terminal asks for Terminal instead; one started by launchd asks for the Python binary. Grant them once in System Settings → Privacy & Security.
+
+Tool calls run one at a time across all clients (Music.app and the web player can't take two callers at once), so a long call such as a big playlist copy makes the others wait.
+
