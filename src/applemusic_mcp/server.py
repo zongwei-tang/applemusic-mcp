@@ -256,12 +256,27 @@ def _loose_contains(needle: Optional[str], haystack: Optional[str]) -> bool:
     n = _normalize_for_match(needle)
     if not n:
         return True
-    return n in _normalize_for_match(haystack)
+    h = _normalize_for_match(haystack)
+    if n in h:
+        return True
+    # CJK names are written with or without a space between family and given
+    # name ("松田 聖子" / "松田聖子"); there the space carries no meaning.
+    return _has_cjk(n) and n.replace(" ", "") in h.replace(" ", "")
 
 
 def _loose_equals(a: Optional[str], b: Optional[str]) -> bool:
     """True if `a` and `b` are equal after canonical normalization."""
-    return _normalize_for_match(a) == _normalize_for_match(b)
+    na, nb = _normalize_for_match(a), _normalize_for_match(b)
+    if na == nb:
+        return True
+    return _has_cjk(na) and na.replace(" ", "") == nb.replace(" ", "")
+
+
+_CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯ｦ-ﾟ]")
+
+
+def _has_cjk(s: str) -> bool:
+    return bool(_CJK_RE.search(s))
 
 
 def _fold_latin_marks(s: str) -> str:
@@ -6481,8 +6496,21 @@ def _catalog_match_tracks(
             )
             continue
 
-        song, err, fuzzy = _find_matching_catalog_song(r.value, r.artist or artist)
-        requests_made += 1
+        song, err, fuzzy = None, None, None
+        given_artist = r.artist or artist
+        # "Song - Artist" with no artist given: split it, as playlist add does.
+        # Matching the whole string as a title picks whatever edition fuzzes
+        # closest (a live take) instead of the song itself.
+        if not given_artist and " - " in r.value:
+            # Forward form only: the reversed guess could land on an unrelated song.
+            for split_name, split_artist in _split_track_artist_candidates(r.value)[:1]:
+                song, err, fuzzy = _find_matching_catalog_song(split_name, split_artist)
+                requests_made += 1
+                if song is not None:
+                    break
+        if song is None:
+            song, err, fuzzy = _find_matching_catalog_song(r.value, given_artist)
+            requests_made += 1
         if song is None:
             # A throttle surfaces here as the rate-limit reason, not "not found"
             # (#42) — stop, and mark the remainder UNKNOWN rather than absent.
@@ -6609,14 +6637,27 @@ def _catalog_album_tracks(
             )
             if response.status_code == 200:
                 albums = response.json().get("results", {}).get("albums", {}).get("data", [])
-                for a in albums:
-                    attrs = a.get("attributes", {})
-                    album_name = attrs.get("name", "")
-                    album_artist = attrs.get("artistName", "")
-                    if _loose_contains(r.value, album_name):
-                        if not r.artist or _loose_contains(r.artist, album_artist):
-                            album_id = a.get("id")
-                            break
+
+                def by_artist(a: dict) -> bool:
+                    return not r.artist or _loose_contains(
+                        r.artist, a.get("attributes", {}).get("artistName", "")
+                    )
+
+                # An exact title wins over a loose one: "THE BOOK" must not
+                # resolve to "THE BOOK 3" just because Apple ranked it first.
+                for same in (_loose_equals, _loose_contains):
+                    hit = next(
+                        (
+                            a
+                            for a in albums
+                            if by_artist(a)
+                            and same(r.value, a.get("attributes", {}).get("name", ""))
+                        ),
+                        None,
+                    )
+                    if hit:
+                        album_id = hit.get("id")
+                        break
         except Exception:
             pass
         if not album_id:
@@ -7476,13 +7517,14 @@ def _discover_recommendations(limit: int, format: str, export: str, full: bool) 
         return str(e)
 
 
-def _discover_heavy_rotation(format: str, export: str, full: bool) -> str:
-    """Internal: Get heavy rotation."""
+def _discover_heavy_rotation(format: str, export: str, full: bool, limit: int = 10) -> str:
+    """Internal: Get heavy rotation (Apple returns at most 10 items)."""
     try:
         headers = get_headers()
         response = requests.get(
             f"{BASE_URL}/me/history/heavy-rotation",
             headers=headers,
+            params={"limit": min(max(limit or 10, 1), 10)},
             timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
@@ -7496,11 +7538,14 @@ def _discover_heavy_rotation(format: str, export: str, full: bool) -> str:
         for item in items:
             attrs = item.get("attributes", {})
             genres = attrs.get("genreNames", [])
+            kind = item.get("type", "").replace("library-", "").replace("-", " ")
 
             item_data.append(
                 {
                     "id": item.get("id", ""),
-                    "name": attrs.get("name", ""),
+                    # Apple sometimes returns a library item with no attributes
+                    # (removed since); say so rather than print a blank row.
+                    "name": attrs.get("name") or f"(unnamed {kind or 'item'})",
                     "artist": attrs.get("artistName", ""),
                     "type": item.get("type", "").replace("library-", "").replace("-", " "),
                     "track_count": attrs.get("trackCount", ""),
@@ -7640,7 +7685,7 @@ def discover(
     if action == "recommendations":
         return _discover_recommendations(limit, format, export, full)
     elif action == "heavy_rotation":
-        return _discover_heavy_rotation(format, export, full)
+        return _discover_heavy_rotation(format, export, full, limit)
     elif action == "personal_station":
         return _discover_personal_station()
     else:
@@ -7648,7 +7693,9 @@ def discover(
         sf = storefront if storefront else get_storefront()
 
         if action == "charts":
-            return _discover_charts(chart_type, sf)
+            # The tool's default limit (50) would more than double the old 20-row
+            # chart; keep 20 unless a limit was actually asked for.
+            return _discover_charts(chart_type, sf, 20 if limit == 50 else limit)
         elif action == "top_songs":
             if not artist:
                 return "Error: artist required for top_songs"
@@ -8162,15 +8209,17 @@ def _catalog_artist_details(artist: str) -> str:
         return str(e)
 
 
-def _discover_charts(chart_type: str = "songs", storefront: str = "") -> str:
-    """Internal: Get charts."""
+def _discover_charts(chart_type: str = "songs", storefront: str = "", limit: int = 20) -> str:
+    """Internal: Get charts. Each row carries its catalog id, ready for
+    playlist(action='add', track=<id>)."""
+    limit = min(max(limit or 20, 1), 200)
     try:
         headers = get_headers()
         sf = storefront if storefront else get_storefront()
         response = requests.get(
             f"{BASE_URL}/catalog/{sf}/charts",
             headers=headers,
-            params={"types": chart_type, "limit": 20},
+            params={"types": chart_type, "limit": limit},
             timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
@@ -8184,14 +8233,15 @@ def _discover_charts(chart_type: str = "songs", storefront: str = "") -> str:
                 chart_title = chart.get("name", chart_name)
                 output.append(f"=== {chart_title} ===")
 
-                for i, item in enumerate(chart.get("data", [])[:20], 1):
+                for i, item in enumerate(chart.get("data", [])[:limit], 1):
                     attrs = item.get("attributes", {})
                     name = attrs.get("name", "Unknown")
                     artist = attrs.get("artistName", "")
+                    cid = f" [{item['id']}]" if item.get("id") else ""
                     if artist:
-                        output.append(f"  {i}. {name} - {artist}")
+                        output.append(f"  {i}. {name} - {artist}{cid}")
                     else:
-                        output.append(f"  {i}. {name}")
+                        output.append(f"  {i}. {name}{cid}")
 
         return "\n".join(output) if output else "No chart data available"
 

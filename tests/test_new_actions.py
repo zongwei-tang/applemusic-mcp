@@ -2,6 +2,7 @@
 
 import json
 import time
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import requests
@@ -282,3 +283,127 @@ class TestNonLatinTitles:
         )
         pid, _, err, _ = server._resolve_catalog_playlist("チル", strict=True)
         assert pid is None and "今日のトップソング (pl.a)" in err
+
+
+def _song(sid, name, artist, album="A"):
+    return {
+        "id": sid,
+        "type": "songs",
+        "attributes": {"name": name, "artistName": artist, "albumName": album},
+    }
+
+
+class TestLiveSweepFixes:
+    """Bugs a live sweep against a JP account found."""
+
+    def test_cjk_artist_spacing_is_ignored(self):
+        assert server._loose_contains("松田聖子", "松田 聖子")
+        assert server._loose_equals("松田 聖子", "松田聖子")
+        # Latin word boundaries keep their meaning
+        assert not server._loose_equals("the band", "theband")
+
+    def test_resolve_splits_song_dash_artist(self, monkeypatch):
+        seen = []
+
+        def search(term, limit=5):
+            seen.append(term)
+            return [
+                _song("live", "夜に駆ける (LIVE 2024)", "YOASOBI"),
+                _song("orig", "夜に駆ける", "YOASOBI"),
+                _song("para", "白いパラソル", "松田 聖子"),
+            ]
+
+        monkeypatch.setattr(server, "_search_catalog_songs", search)
+        out = json.loads(
+            server.catalog(
+                action="resolve",
+                tracks="夜に駆ける - YOASOBI\n白いパラソル - 松田聖子",
+                format="json",
+            )
+        )
+        by_input = {m["input"]: m for m in out["matched"]}
+        assert by_input["夜に駆ける - YOASOBI"]["id"] == "orig"
+        assert by_input["夜に駆ける - YOASOBI"]["confidence"] == "exact"
+        assert by_input["白いパラソル - 松田聖子"]["id"] == "para"
+        assert seen[0] == "夜に駆ける YOASOBI"  # the split, not the raw line
+
+    def test_resolve_falls_back_to_whole_line(self, monkeypatch):
+        def search(term, limit=5):
+            # only the unsplit title exists: "Prelude - Fugue" is one work
+            return [_song("pf", "Prelude - Fugue", "Bach")] if " - " in term else []
+
+        monkeypatch.setattr(server, "_search_catalog_songs", search)
+        out = json.loads(server.catalog(action="resolve", tracks="Prelude - Fugue", format="json"))
+        assert out["ids"] == ["pf"] and out["requests"] == 2
+
+    @resp_lib.activate
+    def test_album_exact_title_beats_loose(self, tokens):
+        resp_lib.add(
+            resp_lib.GET,
+            f"{BASE}/catalog/us/search",
+            json={
+                "results": {
+                    "albums": {
+                        "data": [
+                            {
+                                "id": "b3",
+                                "attributes": {"name": "THE BOOK 3", "artistName": "YOASOBI"},
+                            },
+                            {
+                                "id": "b1",
+                                "attributes": {"name": "THE BOOK", "artistName": "YOASOBI"},
+                            },
+                        ]
+                    }
+                }
+            },
+        )
+        resp_lib.add(
+            resp_lib.GET,
+            f"{BASE}/catalog/us/albums/b1/tracks",
+            json={"data": [_song("1", "Epilogue", "YOASOBI", "THE BOOK")]},
+        )
+        out = server.catalog(action="album_tracks", album="THE BOOK", artist="YOASOBI")
+        assert "Epilogue" in out
+
+    @resp_lib.activate
+    def test_charts_carry_ids_and_honor_limit(self, tokens):
+        resp_lib.add(
+            resp_lib.GET,
+            f"{BASE}/catalog/us/charts",
+            json={
+                "results": {
+                    "songs": [
+                        {
+                            "name": "Top",
+                            "data": [_song(str(i), f"S{i}", "A") for i in range(30)],
+                        }
+                    ]
+                }
+            },
+        )
+        out = server.discover(action="charts", limit=3)
+        assert "1. S0 - A [0]" in out and "3. S2 - A [2]" in out and "S3" not in out
+        assert parse_qs(urlsplit(resp_lib.calls[0].request.url).query)["limit"] == ["3"]
+        default = server.discover(action="charts")
+        assert "20. S19" in default and "S20" not in default
+
+    @resp_lib.activate
+    def test_heavy_rotation_unnamed_item_and_limit(self, tokens):
+        resp_lib.add(
+            resp_lib.GET,
+            f"{BASE}/me/history/heavy-rotation",
+            json={
+                "data": [
+                    {"id": "l.x", "type": "library-albums"},
+                    {
+                        "id": "9",
+                        "type": "albums",
+                        "attributes": {"name": "Real", "artistName": "A"},
+                    },
+                ]
+            },
+        )
+        out = server.discover(action="heavy_rotation", limit=99)
+        assert "(unnamed albums)" in out and "Real - A" in out
+        assert parse_qs(urlsplit(resp_lib.calls[0].request.url).query)["limit"] == ["10"]
