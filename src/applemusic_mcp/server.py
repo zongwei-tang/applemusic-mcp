@@ -213,13 +213,16 @@ def _normalize_for_match(s: Optional[str]) -> str:
     # None-safe: callers pass values straight from .get()/optional fields.
     if not s:
         return ""
+    # 0. NFKC: full-width Latin and digits to ASCII ("ＡＢＣ１" → "ABC1"),
+    #    half-width kana to full-width.
+    s = unicodedata.normalize("NFKC", s)
     # 1. Lowercase and strip
     s = s.lower().strip()
-    # 2. Fold diacritics (café → cafe) BEFORE stripping non-ASCII below, so the
-    #    accented letter collapses to its base form instead of vanishing.
-    s = "".join(
-        c for c in unicodedata.normalize("NFD", s) if not unicodedata.category(c).startswith("M")
-    )
+    # 2. Fold Latin diacritics (café → cafe) BEFORE stripping punctuation below,
+    #    so the accented letter collapses to its base form instead of vanishing.
+    #    Only the Combining Diacritical Marks block is dropped: the kana voicing
+    #    marks (U+3099/U+309A) carry meaning (が is not か) and are recomposed.
+    s = _fold_latin_marks(s)
     # 3. Normalize ampersand to its word form before punctuation is stripped.
     s = s.replace("&", "and")
     # 4. Word-joiners (hyphen, en/em dash, slash, underscore) become spaces so
@@ -231,7 +234,10 @@ def _normalize_for_match(s: Optional[str]) -> str:
     # 5. Strip the remaining punctuation (quote variants, ellipsis, emoji) to
     #    nothing, so intra-word marks fold away ("don't" → "dont", not "don t")
     #    and smart vs straight punctuation cannot cause a mismatch.
-    s = re.sub(r"[^a-z0-9\s]", "", s)
+    #    Letters and digits of every script stay: an ASCII-only class turned
+    #    every Chinese, Japanese, Korean or Cyrillic title into "", so any two of
+    #    them compared equal.
+    s = _strip_symbols(s)
     # 6. Collapse multiple spaces
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -258,6 +264,22 @@ def _loose_equals(a: Optional[str], b: Optional[str]) -> bool:
     return _normalize_for_match(a) == _normalize_for_match(b)
 
 
+def _fold_latin_marks(s: str) -> str:
+    """Drop Latin combining diacritics (café → cafe) but keep the kana voicing
+    marks, which change the word (が is not か); recompose with NFC."""
+    return unicodedata.normalize(
+        "NFC",
+        "".join(c for c in unicodedata.normalize("NFD", s) if not "̀" <= c <= "ͯ"),
+    )
+
+
+def _strip_symbols(s: str) -> str:
+    """Remove punctuation and emoji, keeping letters and digits of every script.
+    The modifier apostrophes (ʹ ʺ ʻ ʼ ʽ ʾ ʿ, U+02B9–U+02BF) are letters to Unicode
+    but quotes in a title ("Itʼs"), so they go too."""
+    return re.sub(r"[^\w\s]|_|[ʹ-ʿ]", "", s)
+
+
 def _normalize_with_tracking(name: str) -> tuple[list[str], list[str]]:
     """Normalize a name for fuzzy matching and track transformations applied.
 
@@ -272,16 +294,13 @@ def _normalize_with_tracking(name: str) -> tuple[list[str], list[str]]:
     """
     transformations = []
 
-    # Step 1: Lowercase and strip
-    name = name.lower().strip()
+    # Step 1: Lowercase and strip (NFKC first: full-width Latin → ASCII)
+    name = unicodedata.normalize("NFKC", name).lower().strip()
 
     # Step 2: Remove diacritics (café → cafe)
-    if any(unicodedata.category(c).startswith("M") for c in unicodedata.normalize("NFD", name)):
-        name = "".join(
-            c
-            for c in unicodedata.normalize("NFD", name)
-            if not unicodedata.category(c).startswith("M")
-        )
+    folded = _fold_latin_marks(name)
+    if folded != name:
+        name = folded
         transformations.append("removed diacritics")
 
     # Step 3: Strip leading articles (The Beatles → Beatles)
@@ -326,7 +345,7 @@ def _normalize_with_tracking(name: str) -> tuple[list[str], list[str]]:
         transformations.append("hyphens → spaces")
 
     # Step 8: Remove emojis and special characters (keep only alphanumeric and spaces)
-    cleaned = re.sub(r"[^a-z0-9\s]", "", name)
+    cleaned = _strip_symbols(name)
     if cleaned != name:
         transformations.append("removed special characters/emojis")
         name = cleaned
@@ -340,12 +359,7 @@ def _normalize_with_tracking(name: str) -> tuple[list[str], list[str]]:
     all_variations = []
     for variant in variations:
         # Apply all transformations to each variant
-        v = variant
-        v = "".join(
-            c
-            for c in unicodedata.normalize("NFD", v)
-            if not unicodedata.category(c).startswith("M")
-        )
+        v = _fold_latin_marks(variant)
         for article in [r"\bthe\s+", r"\ban\s+", r"\ba\s+"]:
             v = re.sub(f"^{article}", "", v)
         for pattern, replacement in abbrev_map.items():
@@ -353,7 +367,7 @@ def _normalize_with_tracking(name: str) -> tuple[list[str], list[str]]:
         v = v.replace("'", "").replace("'", "").replace("`", "")
         v = v.replace('"', "").replace('"', "").replace('"', "")
         v = v.replace("-", " ")
-        v = re.sub(r"[^a-z0-9\s]", "", v)
+        v = _strip_symbols(v)
         v = re.sub(r"\s+", " ", v).strip()
         all_variations.append(v)
 

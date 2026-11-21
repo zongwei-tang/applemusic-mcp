@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Names in Chinese, Japanese, Korean, Cyrillic and other non-Latin scripts.** Name matching kept only `a-z` and digits, so every such title became an empty string and any two compared equal: a lookup by a Japanese playlist name could match a different playlist, and `duplicates` grouped unrelated songs. Letters of every script now count; only Latin accents fold (é → e), kana voicing marks stay (が is not か), and full-width characters fold to their normal width.
 - **Storefront follows your account.** With no `storefront` preference set, catalog requests used `us` even for an account in another region, so ids could come from the wrong catalog. The server now asks Apple for the account's storefront (`APPLEMUSIC_STOREFRONT` overrides it), and `config info` and `auth-status` say which one is used and why.
 - **Tests:** the guard against real network calls in the mocked suite was bypassed when an HTTP proxy was set, because the socket went to the proxy on localhost. Proxy variables are now cleared for non-live tests.
 - **Tests:** four sign-in tests failed on a Mac without the `browser` extra; they now pin the Chrome path themselves.

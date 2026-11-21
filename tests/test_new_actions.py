@@ -224,3 +224,61 @@ class TestArtistDetails:
         resp_lib.add(resp_lib.GET, f"{self.ART}/albums", json={"data": []})
         out = server.catalog(action="artist_details", artist="42")
         assert out.startswith("Artist: Band")
+
+
+class TestNonLatinTitles:
+    """Titles in other scripts used to normalize to '' and all compare equal."""
+
+    @pytest.mark.parametrize(
+        "a,b",
+        [
+            ("分手總要在雨天", "吻別"),
+            ("夜に駆ける", "群青"),
+            ("はがゆい唇", "はかゆい唇"),  # the voicing mark matters
+            ("Кино", "Звезда"),
+            ("사랑", "이별"),
+        ],
+    )
+    def test_distinct_titles_stay_distinct(self, a, b):
+        assert server._normalize_for_match(a) != server._normalize_for_match(b)
+        assert server._normalize_for_match(a)
+
+    def test_full_width_and_spacing_fold(self):
+        assert server._normalize_for_match("ＹＯＡＳＯＢＩ") == "yoasobi"
+        assert server._normalize_for_match("アイドル!") == server._normalize_for_match("アイドル")
+        assert server._normalize_for_match("ｱｲﾄﾞﾙ") == server._normalize_for_match("アイドル")
+
+    def test_latin_accents_still_fold(self):
+        assert server._normalize_for_match("Björk") == "bjork"
+
+    def test_fuzzy_variations_keep_cjk(self):
+        variations, _ = server._normalize_with_tracking("分手總要在雨天")
+        assert variations == ["分手總要在雨天"]
+
+    def test_duplicates_no_longer_merge_different_cjk_songs(self, monkeypatch):
+        songs = [
+            _t("分手總要在雨天", "張學友", "1"),
+            _t("吻別", "張學友", "2"),
+            _t("一路上有你", "張學友", "3"),
+        ]
+        monkeypatch.setattr(amp_api, "resolve_playlist_id", lambda n, api_created_only=False: "p.x")
+        monkeypatch.setattr(amp_api, "get_tracks", lambda pid: songs)
+        assert (
+            server.playlist(action="duplicates", playlist="x") == "No duplicates in 'x' (3 tracks)"
+        )
+
+    @resp_lib.activate
+    def test_strict_catalog_playlist_guard_holds_for_japanese(self, tokens):
+        resp_lib.add(
+            resp_lib.GET,
+            f"{BASE}/catalog/us/search",
+            json={
+                "results": {
+                    "playlists": {
+                        "data": [{"id": "pl.a", "attributes": {"name": "今日のトップソング"}}]
+                    }
+                }
+            },
+        )
+        pid, _, err, _ = server._resolve_catalog_playlist("チル", strict=True)
+        assert pid is None and "今日のトップソング (pl.a)" in err
