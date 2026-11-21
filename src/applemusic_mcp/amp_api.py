@@ -325,7 +325,7 @@ def search_library_songs(term: str, limit: int = 25) -> list[dict]:
 def search_catalog_songs(term: str, limit: int = 5) -> list[dict]:
     """Catalog song search: [{id, name, artist}]."""
     try:
-        store = auth.get_user_preferences().get("storefront", "us")
+        store = auth.get_storefront()
         r = requests.get(
             f"{AMP}/catalog/{store}/search",
             headers=_headers(),

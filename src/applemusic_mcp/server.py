@@ -903,9 +903,11 @@ _SYNC_NUDGE_AFTER_S = 20.0
 
 
 def get_storefront() -> str:
-    """Get storefront from preferences, defaulting to 'us'."""
-    prefs = get_user_preferences()
-    return prefs.get("storefront", DEFAULT_STOREFRONT)
+    """The catalog storefront: the explicit preference, else APPLEMUSIC_STOREFRONT,
+    else the signed-in account's own storefront, else 'us'."""
+    from .auth import get_storefront as _resolved
+
+    return _resolved()
 
 
 # `serverInfo.version` should be OUR version. mcp 1.x has no `version` parameter
@@ -1465,6 +1467,127 @@ def _safe_single_match(matches: list[dict], term: str) -> tuple[dict, int]:
     exact = [m for m in matches if m.get("name", "").strip().lower() == tl]
     chosen = exact[0] if exact else matches[0]
     return chosen, len(matches) - 1
+
+
+def _read_playlist_api(playlist: str) -> tuple[Optional[list[dict]], Optional[str]]:
+    """(tracks, error) for a library playlist read over the web API, in order."""
+    if not capabilities.current().network:
+        return None, "Error: " + capabilities.denied_message(
+            "Reading playlists over the API", "api"
+        )
+    if not playlist:
+        return None, "Error: playlist required"
+    pid = amp_api.resolve_playlist_id(playlist, api_created_only=False)
+    if not pid:
+        return None, _resolve_failure_msg(f"playlist {playlist!r} not found in your library")
+    tracks = amp_api.get_tracks(pid)
+    if tracks is None:
+        return None, _unreadable_playlist_msg(playlist)
+    return tracks, None
+
+
+def _same_recording_key(t: dict) -> str:
+    """Two entries are the same recording when their catalog ids match; without
+    one, fall back to the normalized title and artist."""
+    cid = t.get("catalog_id")
+    if cid:
+        return f"id:{cid}"
+    return f"name:{_normalize_for_match(t.get('name'))}|{_normalize_for_match(t.get('artist'))}"
+
+
+def _same_song_key(t: dict) -> str:
+    return f"{_normalize_for_match(t.get('name'))}|{_normalize_for_match(t.get('artist'))}"
+
+
+def _track_label(t: dict) -> str:
+    return f"{t.get('name') or '?'} - {t.get('artist') or '?'}"
+
+
+def _playlist_duplicates(playlist: str) -> str:
+    """Read-only report of repeated tracks in a playlist."""
+    tracks, err = _read_playlist_api(playlist)
+    if err:
+        return err
+    if not tracks:
+        return f"'{playlist}' is empty"
+    exact: dict[str, list[int]] = {}
+    for i, t in enumerate(tracks, 1):
+        exact.setdefault(_same_recording_key(t), []).append(i)
+    repeated = [(k, pos) for k, pos in exact.items() if len(pos) > 1]
+
+    # Same title and artist under different catalog ids: another edition (album
+    # vs single vs remaster). Reported apart, because it may be deliberate.
+    first_of = {k: tracks[pos[0] - 1] for k, pos in exact.items()}
+    by_song: dict[str, list[str]] = {}
+    for k, t in first_of.items():
+        by_song.setdefault(_same_song_key(t), []).append(k)
+    editions = [ks for ks in by_song.values() if len(ks) > 1]
+
+    if not repeated and not editions:
+        return f"No duplicates in '{playlist}' ({len(tracks)} tracks)"
+    lines = [f"=== Duplicates in '{playlist}' ({len(tracks)} tracks) ==="]
+    if repeated:
+        extra = sum(len(p) - 1 for _, p in repeated)
+        lines.append(f"\nSame recording more than once: {len(repeated)} songs, {extra} extra")
+        for k, pos in repeated:
+            t = tracks[pos[0] - 1]
+            cid = f" [{t['catalog_id']}]" if t.get("catalog_id") else ""
+            lines.append(
+                f"  {_track_label(t)} x{len(pos)} at positions {', '.join(map(str, pos))}{cid}"
+            )
+    if editions:
+        lines.append(f"\nSame title and artist, different editions: {len(editions)} songs")
+        for ks in editions:
+            parts = []
+            for k in ks:
+                t = first_of[k]
+                cid = t.get("catalog_id") or "no catalog id"
+                parts.append(f"#{exact[k][0]} [{cid}]")
+            lines.append(f"  {_track_label(first_of[ks[0]])}: {', '.join(parts)}")
+    lines.append(
+        "\nNothing was removed. To drop one, use playlist(action='remove', playlist=..., "
+        "track=...)."
+    )
+    return "\n".join(lines)
+
+
+def _playlist_compare(playlist: str, other: str, limit: int = 0) -> str:
+    """Read-only diff of two playlists: shared songs and songs only in each."""
+    if not other:
+        return "Error: compare needs `playlist` and `source` (the playlist to compare with)"
+    a, err = _read_playlist_api(playlist)
+    if err:
+        return err
+    b, err = _read_playlist_api(other)
+    if err:
+        return err
+
+    def keyed(tracks):
+        out: dict[str, dict] = {}
+        for t in tracks:
+            out.setdefault(_same_recording_key(t), t)
+        return out
+
+    ka, kb = keyed(a), keyed(b)
+    only_a = [t for k, t in ka.items() if k not in kb]
+    only_b = [t for k, t in kb.items() if k not in ka]
+    both = [t for k, t in ka.items() if k in kb]
+    cap = limit if limit and limit > 0 else 100
+
+    def section(title, items):
+        lines = [f"\n{title}: {len(items)}"]
+        lines += [f"  {_track_label(t)}" for t in items[:cap]]
+        if len(items) > cap:
+            lines.append(f"  ... and {len(items) - cap} more (raise `limit`)")
+        return lines
+
+    lines = [
+        f"=== '{playlist}' ({len(a)} tracks) vs '{other}' ({len(b)} tracks) ===",
+        f"Shared songs: {len(both)}",
+    ]
+    lines += section(f"Only in '{playlist}'", only_a)
+    lines += section(f"Only in '{other}'", only_b)
+    return "\n".join(lines)
 
 
 def _playlist_remove_api(playlist: str, track: str, artist: str = "") -> str:
@@ -3354,15 +3477,19 @@ def _playlist_list(
         warning = get_token_expiration_warning()
         prefix = f"{warning}\n\n" if warning and format == "text" else ""
 
-        return prefix + format_output(
-            playlist_data,
-            format,
-            export,
-            full,
-            "playlists",
-            total_count=total_count,
-            offset=offset,
-        ) + _more_items_hint(format, len(playlist_data), offset, total_count, noun="playlists")
+        return (
+            prefix
+            + format_output(
+                playlist_data,
+                format,
+                export,
+                full,
+                "playlists",
+                total_count=total_count,
+                offset=offset,
+            )
+            + _more_items_hint(format, len(playlist_data), offset, total_count, noun="playlists")
+        )
 
     except requests.exceptions.RequestException as e:
         return _api_error(e)
@@ -5267,7 +5394,7 @@ def playlist(
     auto_add: Optional[bool] = None,
     replace: str = "",
 ) -> str:
-    """Playlist and folder operations. Actions: list, folders (macOS — show the folder tree; folders are NOT in `list`), tracks, search, create, add, copy, move, path (macOS), remove, delete, rename. (move/remove/delete/rename work on every OS — via Music.app on macOS, via the web API on Windows/Linux. Only folders/path are macOS-only.) To find a playlist by name, use action='list' with filter='alice' (loose name match) rather than action='search', which searches the TRACKS inside a given playlist and needs a playlist param. action='tracks' returns one page: limit (default 500; 0 = every track) caps the tracks returned, offset pages through longer playlists, and the text header shows 'start-end of total' with a note when more remain; filter (loose match on track name or artist) is applied across the whole playlist, then paged. Folders support slash-separated paths (e.g. 'Summer/Chill/Deep'). For action='add', `track` accepts a song NAME, a catalog song id (a numeric id like '1440857781' — pins the EXACT edition, avoiding name/album version mismatches), or a library id; set auto_add=True to find tracks not already in the user's library — this is required to add catalog songs the user doesn't own. Note: adding a not-yet-owned catalog track to a Music.app-made playlist is two-step — it's added to the library over the API, then attached locally once iCloud syncs it down (usually seconds). If the sync is slow it may return "added to your library — re-run to attach"; just re-run the same add. Rarely, if the sync stalls past ~20s, Music.app briefly flashes to the foreground as a last-resort sync nudge — expected, not a glitch. To SWAP one track for another, use action='add' with `replace`=<the old track to remove>: it adds the new track, confirms it actually persisted, and only THEN removes the old one — so if the add silently reverts (a Music.app bug), the old track is kept rather than lost."""
+    """Playlist and folder operations. Actions: list, folders (macOS — show the folder tree; folders are NOT in `list`), tracks, search, create, add, copy, move, path (macOS), remove, delete, rename, duplicates, compare. duplicates (read-only) lists repeated tracks in `playlist`; compare (read-only) diffs `playlist` against `source`. (move/remove/delete/rename work on every OS — via Music.app on macOS, via the web API on Windows/Linux. Only folders/path are macOS-only.) To find a playlist by name, use action='list' with filter='alice' (loose name match) rather than action='search', which searches the TRACKS inside a given playlist and needs a playlist param. action='tracks' returns one page: limit (default 500; 0 = every track) caps the tracks returned, offset pages through longer playlists, and the text header shows 'start-end of total' with a note when more remain; filter (loose match on track name or artist) is applied across the whole playlist, then paged. Folders support slash-separated paths (e.g. 'Summer/Chill/Deep'). For action='add', `track` accepts a song NAME, a catalog song id (a numeric id like '1440857781' — pins the EXACT edition, avoiding name/album version mismatches), or a library id; set auto_add=True to find tracks not already in the user's library — this is required to add catalog songs the user doesn't own. Note: adding a not-yet-owned catalog track to a Music.app-made playlist is two-step — it's added to the library over the API, then attached locally once iCloud syncs it down (usually seconds). If the sync is slow it may return "added to your library — re-run to attach"; just re-run the same add. Rarely, if the sync stalls past ~20s, Music.app briefly flashes to the foreground as a last-resort sync nudge — expected, not a glitch. To SWAP one track for another, use action='add' with `replace`=<the old track to remove>: it adds the new track, confirms it actually persisted, and only THEN removes the old one — so if the add silently reverts (a Music.app bug), the old track is kept rather than lost."""
     action = action.lower().strip().replace("-", "_")
 
     if action == "list":
@@ -5325,6 +5452,13 @@ def playlist(
         return _playlist_add(playlist, track, album, artist, allow_duplicates, verify, auto_add)
     elif action == "copy":
         return _playlist_copy(source, new_name)
+    elif action in ("duplicates", "dupes"):
+        return _playlist_duplicates(playlist or name)
+    elif action in ("compare", "diff"):
+        # `limit` defaults to the track-page size (500); only an explicit smaller
+        # value caps the lists here.
+        cap = limit if 0 < limit < _PLAYLIST_TRACKS_DEFAULT_LIMIT else 0
+        return _playlist_compare(playlist or name, source, cap)
     elif action == "remove":
         rail = _write_rail("remove")
         if rail == "web":
@@ -5410,7 +5544,7 @@ def playlist(
         else:
             return _playlist_tree()
     else:
-        return f"Unknown action: {action}. Use: list, folders (macOS), tracks, search, create, add, copy, move, path (macOS), remove, delete, rename"
+        return f"Unknown action: {action}. Use: list, folders (macOS), tracks, search, create, add, copy, move, path (macOS), remove, delete, rename, duplicates, compare"
 
 
 # ============ LIBRARY MANAGEMENT ============
@@ -5441,7 +5575,7 @@ def library(
     rate_action: str = "",
     stars: int = 0,
 ) -> str:
-    """Your library. Actions: search, add, recently_played, recently_added, browse, favorites (macOS), rate, remove, snapshot (macOS). action='search' searches the user's local library only — for catalog (Apple Music's full library) use catalog(action='search'). For search, types can be 'songs' (default), 'artists', 'albums', 'all', or 'genre' — types='genre' lists the user's own tracks whose genre matches query (e.g. query='Rock'); genre filtering is macOS-only (local Music app). Search returns one page: limit (default 25) caps results and offset pages through larger result sets — the text header shows 'start-end of total' so you know when more remain. action='favorites' lists songs marked Favorite (loved) in Music.app. action='add' adds catalog tracks/albums — or a whole catalog playlist via `playlist` (a pl. id, music.apple.com URL or name; see catalog(action='playlist_tracks')) — to your library over the API (developer token — generated or harvested — plus a media-user-token from `signin`); there is no UI-automation fallback. In api mode, search/browse read via the API and love/dislike rate via the API; star ratings (rate get/set) need native mode (local Music.app)."""
+    """Your library. Actions: search, add, recently_played, recently_added, browse, favorites (macOS), rate, remove, stats, snapshot (macOS). action='stats' counts songs, albums, artists, playlists and music videos. action='search' searches the user's local library only — for catalog (Apple Music's full library) use catalog(action='search'). For search, types can be 'songs' (default), 'artists', 'albums', 'all', or 'genre' — types='genre' lists the user's own tracks whose genre matches query (e.g. query='Rock'); genre filtering is macOS-only (local Music app). Search returns one page: limit (default 25) caps results and offset pages through larger result sets — the text header shows 'start-end of total' so you know when more remain. action='favorites' lists songs marked Favorite (loved) in Music.app. action='add' adds catalog tracks/albums — or a whole catalog playlist via `playlist` (a pl. id, music.apple.com URL or name; see catalog(action='playlist_tracks')) — to your library over the API (developer token — generated or harvested — plus a media-user-token from `signin`); there is no UI-automation fallback. In api mode, search/browse read via the API and love/dislike rate via the API; star ratings (rate get/set) need native mode (local Music.app)."""
     action = action.lower().strip().replace("-", "_")
 
     if action == "search":
@@ -5477,6 +5611,8 @@ def library(
         if err := _macos_only("remove"):
             return err
         return _label_write(_library_remove(track, artist), rail)
+    elif action in ("stats", "count", "counts"):
+        return _library_stats()
     elif action == "snapshot":
         if err := _macos_only("snapshot"):
             return err
@@ -5494,7 +5630,50 @@ def library(
         else:
             return _library_snapshot_default()
     else:
-        return f"Unknown action: {action}. Use: search, add, recently_played, recently_added, browse, favorites, rate, remove, snapshot"
+        return f"Unknown action: {action}. Use: search, add, recently_played, recently_added, browse, favorites, rate, remove, stats, snapshot"
+
+
+_LIBRARY_STAT_TYPES = ("songs", "albums", "artists", "playlists", "music-videos")
+
+
+def _library_stats() -> str:
+    """Counts of what's in the library, one cheap request per type (limit=1 and
+    the response's meta.total)."""
+    if not capabilities.current().network:
+        return "Error: " + capabilities.denied_message("Library stats", "api")
+    try:
+        headers = get_headers()
+    except (FileNotFoundError, ValueError) as e:
+        return f"Error: {e}"
+    lines = ["=== Your Apple Music library ==="]
+    unknown = 0
+    for kind in _LIBRARY_STAT_TYPES:
+        try:
+            r = requests.get(
+                f"{BASE_URL}/me/library/{kind}",
+                headers=headers,
+                params={"limit": 1},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as e:
+            return _api_error(e)
+        if r.status_code in (401, 403):
+            return (
+                f"Error: not authorized (status {r.status_code}) — re-run `applemusic-mcp login`."
+            )
+        total = None
+        if r.status_code == 200:
+            total = (r.json().get("meta") or {}).get("total")
+        elif r.status_code == 404:
+            total = 0  # Apple answers an empty collection with 404
+        if isinstance(total, int):
+            lines.append(f"  {kind.replace('-', ' ')}: {total:,}")
+        else:
+            unknown += 1
+            lines.append(f"  {kind.replace('-', ' ')}: unknown (status {r.status_code})")
+    if unknown == len(_LIBRARY_STAT_TYPES):
+        return "Error: couldn't read any library counts — check config(action='auth-status')."
+    return "\n".join(lines)
 
 
 def _library_search(
@@ -6853,7 +7032,7 @@ def _resolve_explicit_ratings(tracks: list[dict], budget: int = _CLEAN_VERIFY_BU
     by_id = {t.get("catalog_id", ""): t for t in pending if t.get("catalog_id")}
     if by_id:
         try:
-            ratings = amp_api.catalog_content_ratings(list(by_id))
+            ratings = amp_api.catalog_content_ratings(list(by_id), get_storefront())
         except Exception:
             ratings = {}
         cache = get_track_cache()
@@ -7842,6 +8021,30 @@ def _catalog_song_details(song_id: str) -> str:
         return str(e)
 
 
+def _artist_view(artist_id: str, view: str, limit: int, headers: dict) -> Optional[list[dict]]:
+    """An artist relationship view (latest-release, top-songs, full-albums,
+    singles, ...), or None on any failure — the caller falls back or omits it."""
+    try:
+        r = requests.get(
+            f"{BASE_URL}/catalog/{get_storefront()}/artists/{artist_id}/view/{view}",
+            headers=headers,
+            params={"limit": limit},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json().get("data")
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+
+def _newest_first(items: list[dict]) -> list[dict]:
+    return sorted(
+        items, key=lambda x: x.get("attributes", {}).get("releaseDate") or "", reverse=True
+    )
+
+
 def _catalog_artist_details(artist: str) -> str:
     """Internal: Get artist details."""
     if not artist:
@@ -7891,24 +8094,51 @@ def _catalog_artist_details(artist: str) -> str:
             f"Genres: {', '.join(attrs.get('genreNames', ['Unknown']))}",
         ]
 
-        # Get artist's albums
-        albums_response = requests.get(
-            f"{BASE_URL}/catalog/{get_storefront()}/artists/{artist_id}/albums",
-            headers=headers,
-            params={"limit": 10},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if albums_response.status_code == 200:
-            albums_data = albums_response.json()
-            albums = albums_data.get("data", [])
-            if albums:
-                output.append("\nRecent Albums:")
-                for album in albums[:10]:
-                    album_attrs = album.get("attributes", {})
-                    name = album_attrs.get("name", "Unknown")
-                    year = album_attrs.get("releaseDate", "")[:4]
-                    album_id = album.get("id")
-                    output.append(f"  - {name} ({year}) [catalog ID: {album_id}]")
+        def album_line(album: dict) -> str:
+            a = album.get("attributes", {})
+            day = a.get("releaseDate", "")
+            return f"  - {a.get('name', 'Unknown')} ({day[:4]}) [catalog ID: {album.get('id')}]"
+
+        latest = _artist_view(artist_id, "latest-release", 1, headers)
+        if latest:
+            a = latest[0].get("attributes", {})
+            output.append(
+                f"\nLatest release: {a.get('name', 'Unknown')} ({a.get('releaseDate', '')}) "
+                f"[catalog ID: {latest[0].get('id')}]"
+            )
+
+        top = _artist_view(artist_id, "top-songs", 10, headers)
+        if top:
+            output.append("\nTop songs:")
+            for s in top:
+                a = s.get("attributes", {})
+                output.append(
+                    f"  - {a.get('name', 'Unknown')} ({a.get('albumName', '')}) "
+                    f"[catalog ID: {s.get('id')}]"
+                )
+
+        # Full albums newest first; singles are listed apart, as Apple does. The
+        # plain /albums relationship (unordered, mixed) is the fallback.
+        full_albums = _artist_view(artist_id, "full-albums", 25, headers)
+        singles = _artist_view(artist_id, "singles", 10, headers) if full_albums else None
+        if full_albums:
+            output.append("\nAlbums (newest first):")
+            output += [album_line(x) for x in _newest_first(full_albums)]
+            if singles:
+                output.append("\nRecent singles:")
+                output += [album_line(x) for x in _newest_first(singles)]
+        else:
+            albums_response = requests.get(
+                f"{BASE_URL}/catalog/{get_storefront()}/artists/{artist_id}/albums",
+                headers=headers,
+                params={"limit": 25},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if albums_response.status_code == 200:
+                albums = albums_response.json().get("data", [])
+                if albums:
+                    output.append("\nRecent Albums:")
+                    output += [album_line(x) for x in _newest_first(albums)[:10]]
 
         return "\n".join(output)
 
@@ -8350,8 +8580,11 @@ def config(
             # User Preferences
             prefs = get_user_preferences()
             output.append("Preferences (set via config(action='set-pref', ...)):")
+            from .auth import resolve_storefront
+
+            sf, sf_source = resolve_storefront()
             output.append(
-                f"  storefront: {prefs['storefront']} (list: config(action='list-storefronts'))"
+                f"  storefront: {sf} (from {sf_source}; list: config(action='list-storefronts'))"
             )
             output.append(f"  fetch_explicit: {prefs['fetch_explicit']}")
             output.append(f"  clean_only: {prefs['clean_only']}")
@@ -8948,7 +9181,13 @@ def _auth_action(action: str = "status", confirm: bool = False) -> str:
         # Show the engines `mode` resolves to, so the user can see what auto picks
         # (e.g. playback=native, queue=safari on macOS) and where playback will land.
         engines = f"Engines: playback={_playback_engine()}, queue={_queue_engine()}"
-        return f"{body}\nMode: {mode}\n{engines}\nWrites: {write_rail}\n\n{nxt}"
+        from .auth import resolve_storefront
+
+        sf, sf_source = resolve_storefront()
+        return (
+            f"{body}\nMode: {mode}\n{engines}\nWrites: {write_rail}\n"
+            f"Storefront: {sf} (from {sf_source})\n\n{nxt}"
+        )
 
     if action in ("signin", "login"):
         if not capabilities.current().web:

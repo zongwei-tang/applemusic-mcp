@@ -582,17 +582,16 @@ class TestFormatOutput:
 
 
 class TestGetStorefront:
-    def test_defaults_to_us(self, monkeypatch):
-        monkeypatch.setattr(server, "get_user_preferences", lambda: {"storefront": "us"})
+    """Precedence is covered in test_storefront.py; this checks the server wrapper."""
+
+    def test_defaults_to_us(self, mock_config_dir):
         assert server.get_storefront() == "us"
 
-    def test_custom_storefront(self, monkeypatch):
-        monkeypatch.setattr(server, "get_user_preferences", lambda: {"storefront": "gb"})
+    def test_custom_storefront(self, mock_config_dir):
+        (mock_config_dir / "config.json").write_text(
+            json.dumps({"preferences": {"storefront": "gb"}})
+        )
         assert server.get_storefront() == "gb"
-
-    def test_missing_storefront_key(self, monkeypatch):
-        monkeypatch.setattr(server, "get_user_preferences", lambda: {})
-        assert server.get_storefront() == "us"
 
 
 # ---------------------------------------------------------------------------

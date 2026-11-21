@@ -11,10 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Streamable HTTP transport.** `serve --transport http` runs one long-lived server at `http://127.0.0.1:8770/mcp` that clients reach by URL. It binds loopback by default with DNS-rebinding protection on, takes an optional bearer token (`APPLEMUSIC_MCP_TOKEN` or `--token`), and refuses a non-loopback `--host` without one. Works on mcp 1.x and 2.x.
 - **Catalog playlists.** `catalog(action='playlist_tracks')` lists the songs in an Apple editorial or shared playlist, by `pl.` id, music.apple.com URL or name. `library(action='add', playlist=...)` saves one to your library.
+- **`playlist(action='duplicates')`** lists repeated tracks with their positions, and the same song in different editions apart. **`playlist(action='compare')`** shows the songs two playlists share and the ones only in each. Both are read-only.
+- **`library(action='stats')`** counts songs, albums, artists, playlists and music videos.
+- **`catalog(action='artist_details')`** adds the latest release and top songs, and lists albums newest first with singles apart.
 - **Cloud deployment.** A `Dockerfile` runs a library-and-playlist server at `--level api` with `--no-playback`, which hides the playback and queue tools. The port follows `$PORT`, `GET /healthz` answers without auth for health probes, and a public bind needs a bearer token of at least 32 characters. `applemusic-mcp export-token` copies your Apple Music user token to the clipboard for the host's secret store.
 
 ### Fixed
 
+- **Storefront follows your account.** With no `storefront` preference set, catalog requests used `us` even for an account in another region, so ids could come from the wrong catalog. The server now asks Apple for the account's storefront (`APPLEMUSIC_STOREFRONT` overrides it), and `config info` and `auth-status` say which one is used and why.
 - **Tests:** the guard against real network calls in the mocked suite was bypassed when an HTTP proxy was set, because the socket went to the proxy on localhost. Proxy variables are now cleared for non-live tests.
 - **Tests:** four sign-in tests failed on a Mac without the `browser` extra; they now pin the Chrome path themselves.
 

@@ -51,6 +51,8 @@ Tool calls run one at a time across all clients (Music.app and the web player ca
 
 The repo's `Dockerfile` builds a server that keeps working while your Mac is off. A container has no Music.app or browser, so it runs at `--level api` with `--no-playback`: catalog search, your library, playlists and discovery, with no playback, Up Next or AirPlay.
 
+The catalog storefront comes from your account (`GET /v1/me/storefront`); set `APPLEMUSIC_STOREFRONT` (e.g. `jp`) as a plain variable to pin it, since a container's disk, and with it any `set-pref`, resets on every deploy.
+
 It needs two secrets, set in the host's secret store (on Railway, as **sealed** variables, which the dashboard, API and CLI never show again):
 
 | Variable | Value |

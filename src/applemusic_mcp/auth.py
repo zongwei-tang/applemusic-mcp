@@ -359,6 +359,72 @@ def get_user_preferences() -> dict:
     }
 
 
+# ============ STOREFRONT ============
+
+ENV_STOREFRONT = "APPLEMUSIC_STOREFRONT"
+_STOREFRONT_RE = re.compile(r"^[a-z]{2}$")
+# Detected storefront per user token. Only successes are cached: a transient 429
+# must not pin the process to the wrong region until the next restart.
+_detected_storefront: dict[str, str] = {}
+
+
+def _detect_account_storefront() -> Optional[str]:
+    """The signed-in account's storefront from ``GET /v1/me/storefront``, or None.
+
+    Catalog ids are per storefront, so a JP account searching the US catalog gets
+    ids that may not resolve when added. Network and token failures return None."""
+    try:
+        user_token = get_user_token()
+    except Exception:
+        return None
+    cached = _detected_storefront.get(user_token)
+    if cached:
+        return cached
+    try:
+        r = requests.get(
+            "https://api.music.apple.com/v1/me/storefront",
+            headers={
+                "Authorization": f"Bearer {resolve_developer_token()}",
+                "Music-User-Token": user_token,
+                "Origin": "https://music.apple.com",
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        sf = str((r.json().get("data") or [{}])[0].get("id", "")).lower()
+    except Exception:
+        return None
+    if not _STOREFRONT_RE.match(sf):
+        return None
+    _detected_storefront[user_token] = sf
+    return sf
+
+
+def resolve_storefront() -> tuple[str, str]:
+    """(storefront, where it came from). Order: an explicit ``set-pref`` value,
+    then ``APPLEMUSIC_STOREFRONT``, then the signed-in account's storefront, then
+    ``us``. The env var suits hosts whose disk resets on deploy."""
+    try:
+        explicit = load_config().get("preferences", {}).get("storefront")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        explicit = None
+    if explicit:
+        return str(explicit).lower(), "preference"
+    env = os.environ.get(ENV_STOREFRONT, "").strip().lower()
+    if _STOREFRONT_RE.match(env):
+        return env, ENV_STOREFRONT
+    detected = _detect_account_storefront()
+    if detected:
+        return detected, "your account"
+    return "us", "default"
+
+
+def get_storefront() -> str:
+    """The storefront every catalog request should use (see resolve_storefront)."""
+    return resolve_storefront()[0]
+
+
 def get_private_key_path(config: dict) -> Path:
     """Resolve the private key path from config."""
     path = Path(config["private_key_path"]).expanduser()

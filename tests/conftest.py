@@ -65,6 +65,19 @@ def _unrestricted_level(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pinned_storefront(monkeypatch):
+    """Pin the storefront to 'us' so no test makes the account-storefront
+    detection request (it would shift call-order assertions and strict mocks).
+    Tests of the detection itself delenv this and clear the cache."""
+    from applemusic_mcp import auth
+
+    monkeypatch.setenv(auth.ENV_STOREFRONT, "us")
+    auth._detected_storefront.clear()
+    yield
+    auth._detected_storefront.clear()
+
+
+@pytest.fixture(autouse=True)
 def _block_live_applescript(request, monkeypatch):
     """Hard guarantee: no non-live test runs real AppleScript against the user's
     Music.app. Every AppleScript call funnels through ``asc.run_applescript``;

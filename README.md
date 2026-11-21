@@ -46,7 +46,9 @@ What each engine can do, and the level that turns it on. `✓` supported, `✗` 
 |**1–5 star ratings**|✓|✗|✗|
 |Favorites list|✓|✗|✗|
 |**Playlist** create / add / remove / rename|✓|✓|—|
-|Playlist copy|✓|✗|—|
+|Playlist copy|✓|✓|—|
+|Playlist duplicates / compare two playlists|✗|✓|—|
+|Library stats (counts)|✗|✓|—|
 |Catalog playlists: read tracks / save to library|✗|✓|—|
 |Playlist delete|✓|✓ (web token)|—|
 |Folders: single level + move in/out|✓|✓|—|
@@ -124,8 +126,8 @@ Seven action-based tools keep the MCP context small. Each takes an `action` and 
 
 | Tool | Actions |
 |---|---|
-| `playlist` | list, folders, tracks, search, create, add, copy, move, remove, delete, rename, path (playlists and folders) |
-| `library` | search, add (songs, albums, or a whole catalog playlist), browse, favorites, recently_played, recently_added, rate, remove, snapshot |
+| `playlist` | list, folders, tracks, search, create, add, copy, move, remove, delete, rename, path (playlists and folders), duplicates, compare |
+| `library` | search, add (songs, albums, or a whole catalog playlist), browse, favorites, recently_played, recently_added, rate, remove, stats, snapshot |
 | `catalog` | search, resolve, album_tracks, album_details, playlist_tracks (Apple's editorial and shared playlists), song_details, artist_details, genres, suggestions |
 | `discover` | recommendations, heavy_rotation, charts, top_songs, similar_artists, personal_station, song_station |
 | `playback` | play (track / album / playlist / URL), control, now_playing, settings, reveal, airplay |
