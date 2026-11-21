@@ -1379,6 +1379,10 @@ def _resolve_playlist_for_write(name: str):
     except Exception:
         pls = []
     if pls:
+        # A library id (p.xxx) is the most exact name there is: take it first.
+        by_id = [p for p in pls if p.get("id") == name.strip()]
+        if by_id:
+            return by_id[0], None
         tl = name.strip().lower()
         exact = [p for p in pls if p.get("name", "").strip().lower() == tl]
         if exact:

@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Removing a song that appears more than once in a playlist removed every copy** over the web API, while the reply said only one went. Every copy shares the library-song id and Apple's delete takes them all. The other copies are now put back (at the end of the playlist) and the playlist is re-read to confirm; if that fails, the reply says so.
-- **A library playlist id (`p.…`) works everywhere** over the web API: `rename`, `remove`, `delete`, `duplicates` and `compare` only looked playlists up by name.
+- **A library playlist id (`p.…`) works everywhere** over the web API: `rename`, `remove`, `delete`, `duplicates` and `compare` only looked playlists up by name. For `rename` and `delete` an id now wins over any name match.
 - **`library(action='search')` finds "title artist" queries.** Apple's library search returns nothing for "アイドル YOASOBI"; an empty multi-word search now retries on its longest words and keeps rows that contain every word.
 - **`catalog(action='resolve', tracks=...)` splits "Song - Artist".** It matched the whole line as a title, so "夜に駆ける - YOASOBI" landed on a live recording instead of the song. It now splits the line as `playlist add` does, and falls back to the whole line when the split finds nothing.
 - **CJK names match with or without a space** between family and given name, so "松田聖子" finds "松田 聖子".

@@ -534,3 +534,21 @@ class TestWriteSweepFixes:
         resp_lib.add(resp_lib.GET, f"{BASE}/me/library/search", json={"results": {}})
         assert server.library(action="search", query="nothing") == "No songs found"
         assert len(resp_lib.calls) == 1
+
+
+def test_write_resolver_takes_a_library_id_first(monkeypatch):
+    pls = [
+        {"id": "p.ONE", "name": "p.TWO"},  # a playlist literally named like an id
+        {"id": "p.TWO", "name": "Mix"},
+    ]
+    monkeypatch.setattr(amp_api, "list_playlists", lambda: pls)
+    pl, err = server._resolve_playlist_for_write("p.TWO")
+    assert err is None and pl["name"] == "Mix"
+    pl, err = server._resolve_playlist_for_write(" p.ONE ")
+    assert pl["id"] == "p.ONE"
+    renamed = {}
+    monkeypatch.setattr(
+        amp_api, "rename_playlist", lambda pid, new: renamed.setdefault(pid, new) and (True, "")
+    )
+    assert server._playlist_rename_api("p.TWO", "Mix 2") == "Renamed 'Mix' to 'Mix 2'"
+    assert renamed == {"p.TWO": "Mix 2"}
