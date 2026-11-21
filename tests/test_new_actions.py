@@ -407,3 +407,130 @@ class TestLiveSweepFixes:
         out = server.discover(action="heavy_rotation", limit=99)
         assert "(unnamed albums)" in out and "Real - A" in out
         assert parse_qs(urlsplit(resp_lib.calls[0].request.url).query)["limit"] == ["10"]
+
+
+class TestWriteSweepFixes:
+    """Bugs a live write test found (create/add/rename/remove/delete round trip)."""
+
+    def test_resolve_playlist_accepts_a_library_id(self, monkeypatch):
+        pls = [
+            {"id": "p.AAA", "name": "MCP Test", "canEdit": True},
+            {"id": "p.BBB", "name": "Other", "canEdit": True},
+        ]
+        monkeypatch.setattr(amp_api, "list_playlists", lambda: pls)
+        monkeypatch.setattr(amp_api, "is_api_created", lambda pl: True)
+        assert amp_api.resolve_playlist_id("p.BBB", api_created_only=False) == "p.BBB"
+        assert amp_api.resolve_playlist_id(" p.AAA ") == "p.AAA"
+        assert amp_api.resolve_playlist_id("p.aaa") is None  # ids are case-sensitive
+
+    def _playlist(self, monkeypatch, entries, after_add=None):
+        state = {"tracks": list(entries), "adds": []}
+        monkeypatch.setattr(amp_api, "resolve_playlist_id", lambda n, api_created_only=False: "p.T")
+        monkeypatch.setattr(amp_api, "get_tracks", lambda pid: list(state["tracks"]))
+
+        def remove(pid, rid):
+            # Apple's real behavior: every copy sharing the id goes.
+            state["tracks"] = [t for t in state["tracks"] if t["relationship_id"] != rid]
+            return True, "Removed"
+
+        def add(pid, items):
+            state["adds"].append(items)
+            if after_add is None:
+                rid = items[0][0]
+                src = next(t for t in entries if t["relationship_id"] == rid)
+                state["tracks"].append(dict(src))
+            return True, "Added 1 track(s)"
+
+        monkeypatch.setattr(amp_api, "remove_track", remove)
+        monkeypatch.setattr(amp_api, "add_tracks", add)
+        monkeypatch.setattr(server.audit_log, "log_action", lambda *a, **k: None)
+        return state
+
+    def test_removing_one_copy_keeps_the_others(self, monkeypatch):
+        idol = {
+            "relationship_id": "i.X",
+            "name": "アイドル",
+            "artist": "YOASOBI",
+            "catalog_id": "1",
+        }
+        other = {"relationship_id": "i.Y", "name": "群青", "artist": "YOASOBI", "catalog_id": "2"}
+        state = self._playlist(monkeypatch, [idol, other, dict(idol), dict(idol)])
+        out = server._playlist_remove_api("T", "アイドル", "YOASOBI")
+        assert "It was in the playlist 3 times" in out and "other 2 were added back" in out
+        assert [t["relationship_id"] for t in state["tracks"]].count("i.X") == 2
+        assert state["adds"] == [[("i.X", "library-songs")]] * 2
+        assert "other track(s) also matched" not in out  # copies aren't "other tracks"
+
+    def test_single_copy_needs_no_restore(self, monkeypatch):
+        idol = {
+            "relationship_id": "i.X",
+            "name": "アイドル",
+            "artist": "YOASOBI",
+            "catalog_id": "1",
+        }
+        state = self._playlist(monkeypatch, [idol])
+        out = server._playlist_remove_api("T", "アイドル")
+        assert out.startswith("Removed アイドル - YOASOBI") and "added back" not in out
+        assert state["adds"] == [] and state["tracks"] == []
+
+    def test_failed_restore_is_reported_not_hidden(self, monkeypatch):
+        idol = {
+            "relationship_id": "i.X",
+            "name": "アイドル",
+            "artist": "YOASOBI",
+            "catalog_id": "1",
+        }
+        self._playlist(monkeypatch, [idol, dict(idol)], after_add="nothing lands")
+        out = server._playlist_remove_api("T", "アイドル")
+        assert out.startswith("Warning:") and "left 0 in the playlist" in out
+
+    def test_distinct_other_matches_still_noted(self, monkeypatch):
+        a = {"relationship_id": "i.A", "name": "Love", "artist": "X", "catalog_id": "1"}
+        b = {"relationship_id": "i.B", "name": "Love Song", "artist": "X", "catalog_id": "2"}
+        self._playlist(monkeypatch, [a, b])
+        out = server._playlist_remove_api("T", "Love")
+        assert "1 other track(s) also matched 'Love'" in out
+
+    @resp_lib.activate
+    def test_library_search_title_and_artist(self, tokens, monkeypatch):
+        monkeypatch.setattr(server, "APPLESCRIPT_AVAILABLE", False)
+        url = f"{BASE}/me/library/search"
+
+        def reply(request):
+            term = parse_qs(urlsplit(request.url).query)["term"][0]
+            rows = []
+            if term == "アイドル":
+                rows = [
+                    {
+                        "id": "i.X",
+                        "type": "library-songs",
+                        "attributes": {
+                            "name": "アイドル",
+                            "artistName": "YOASOBI",
+                            "albumName": "アイドル - Single",
+                        },
+                    },
+                    {
+                        "id": "i.Z",
+                        "type": "library-songs",
+                        "attributes": {
+                            "name": "アイドル",
+                            "artistName": "Someone",
+                            "albumName": "B",
+                        },
+                    },
+                ]
+            return (200, {}, json.dumps({"results": {"library-songs": {"data": rows}}}))
+
+        resp_lib.add_callback(resp_lib.GET, url, callback=reply)
+        out = server.library(action="search", query="アイドル YOASOBI")
+        assert "YOASOBI" in out and "Someone" not in out
+        terms = [parse_qs(urlsplit(c.request.url).query)["term"][0] for c in resp_lib.calls]
+        assert terms == ["アイドル YOASOBI", "YOASOBI", "アイドル"]
+
+    @resp_lib.activate
+    def test_library_search_single_word_has_no_retry(self, tokens, monkeypatch):
+        monkeypatch.setattr(server, "APPLESCRIPT_AVAILABLE", False)
+        resp_lib.add(resp_lib.GET, f"{BASE}/me/library/search", json={"results": {}})
+        assert server.library(action="search", query="nothing") == "No songs found"
+        assert len(resp_lib.calls) == 1

@@ -239,9 +239,13 @@ def resolve_playlist(name: str, api_created_only: bool = True) -> Optional[dict]
     match Music.app-made playlists — the web session can write those, and any rail
     can read/play them."""
     loose = None
+    wanted_id = name.strip()
     for pl in list_playlists():
         if api_created_only and not is_api_created(pl):
             continue
+        # A library playlist id (p.xxx) names it exactly; ids are case-sensitive.
+        if pl.get("id") == wanted_id:
+            return pl
         if _loose_eq(pl["name"], name):
             return pl
         if name.strip().lower() in pl["name"].strip().lower():

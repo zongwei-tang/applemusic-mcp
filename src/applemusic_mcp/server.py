@@ -1661,7 +1661,38 @@ def _playlist_remove_api(playlist: str, track: str, artist: str = "") -> str:
             )
         return f"Error: remove failed for {track!r}: {msg}"
     audit_log.log_action("remove_track", {"playlist": playlist, "track": track, "via": "api"})
-    out = f"Removed {chosen['name']} - {chosen['artist']} from {playlist!r}"
+
+    # Every copy of a song in a playlist shares its library-song id, and Apple's
+    # delete removes all of them (verified live). Removing one copy of a song
+    # that appears twice must not cost the other, so put the extras back.
+    rid = chosen["relationship_id"]
+    copies = sum(1 for t in tracks if t["relationship_id"] == rid)
+    restore_note = ""
+    if copies > 1:
+        restored = 0
+        for _ in range(copies - 1):
+            ok_add, _msg = amp_api.add_tracks(pid, [(rid, "library-songs")])
+            restored += 1 if ok_add else 0
+        after = amp_api.get_tracks(pid)
+        left = None if after is None else sum(1 for t in after if t["relationship_id"] == rid)
+        if left == copies - 1:
+            restore_note = (
+                f"\n(It was in the playlist {copies} times. Apple removes every copy at once, "
+                f"so the other {copies - 1} {'was' if copies == 2 else 'were'} added back, "
+                "now at the end of the playlist.)"
+            )
+        else:
+            shown = "unknown" if left is None else str(left)
+            return (
+                f"Warning: removed {chosen['name']} - {chosen['artist']} from {playlist!r}, "
+                f"but it was there {copies} times and Apple removes every copy at once. "
+                f"Re-adding the other {copies - 1} left {shown} in the playlist "
+                f"({restored} re-add(s) succeeded). Check it with playlist(action='tracks')."
+            )
+
+    out = f"Removed {chosen['name']} - {chosen['artist']} from {playlist!r}{restore_note}"
+    # Other copies of the same song are handled above; count different songs only.
+    others = len({t["relationship_id"] for t in matches} - {rid}) if others else 0
     if others:
         out += (
             f"\n({others} other track(s) also matched {track!r} — only that one was "
@@ -5705,6 +5736,43 @@ def _library_stats() -> str:
     return "\n".join(lines)
 
 
+def _library_search_by_words(query: str, headers: dict, limit: int) -> list[dict]:
+    """Retry for "title artist" queries, which Apple's library search answers
+    with nothing ("アイドル YOASOBI" finds nothing; "アイドル" finds the song).
+    Search the longest word, then keep rows where every word appears in the
+    title, artist or album. One extra request, only after an empty result."""
+    words = [w for w in query.split() if w.strip()]
+    if len(words) < 2:
+        return []
+
+    def every_word(song: dict) -> bool:
+        a = song.get("attributes", {})
+        text = " ".join([a.get("name", ""), a.get("artistName", ""), a.get("albumName", "")])
+        return all(_loose_contains(w, text) for w in words)
+
+    # Try the two longest words: which one Apple matches on (title or artist)
+    # isn't knowable up front. At most two extra requests.
+    for anchor in sorted(dict.fromkeys(words), key=len, reverse=True)[:2]:
+        try:
+            r = requests.get(
+                f"{BASE_URL}/me/library/search",
+                headers=headers,
+                params={"term": anchor, "types": "library-songs", "limit": 25},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if r.status_code != 200:
+                continue
+            rows = r.json().get("results", {}).get("library-songs", {}).get("data", [])
+        except capabilities.CapabilityDenied:
+            raise
+        except Exception:
+            continue
+        hits = [s for s in rows if every_word(s)]
+        if hits:
+            return hits[: max(limit, 1)]
+    return []
+
+
 def _library_search(
     query: str,
     types: str = "songs",
@@ -5830,6 +5898,8 @@ def _library_search(
         data = response.json()
 
         songs = data.get("results", {}).get("library-songs", {}).get("data", [])
+        if not songs and offset == 0:
+            songs = _library_search_by_words(query, headers, limit)
         if not songs:
             msg = "No songs found"
             if asc_error:
